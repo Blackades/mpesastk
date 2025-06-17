@@ -2,10 +2,10 @@
 
 /**
  * PHP Mikrotik Billing 
- * M-Pesa Bank STK Push API Integration - FINAL VERSION
+ * M-Pesa Bank STK Push API Integration - FINAL WORKING VERSION
  **/
 
-// Register the callback handler
+// Register the callback handler - This must be at the top of your file
 if (isset($_GET['_route']) && $_GET['_route'] == 'callback/mpesastk') {
     mpesastk_payment_notification();
     exit;
@@ -367,45 +367,55 @@ function mpesastk_create_transaction($trx, $user)
 }
 
 /**
- * Handles M-Pesa payment notification
+ * Handles M-Pesa payment notification - FIXED CALLBACK VERSION
  */
 function mpesastk_payment_notification()
 {
+    // Set proper headers first
     header('Content-Type: application/json');
     
     try {
+        // Get the raw POST data
         $request_body = file_get_contents('php://input');
+        
+        // Log the raw notification for debugging
+        _log('Raw M-Pesa Callback: ' . $request_body, 'M-Pesa-Callback');
+        
         if (empty($request_body)) {
-            throw new Exception('Empty notification body');
+            throw new Exception('Empty callback body');
         }
         
-        _log('M-Pesa Notification: ' . $request_body, 'M-Pesa');
-        
+        // Decode the JSON
         $notification = json_decode($request_body, true);
+        
         if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('Invalid JSON notification');
+            throw new Exception('Invalid JSON in callback: ' . json_last_error_msg());
         }
+        
+        // Log the decoded notification
+        _log('Decoded M-Pesa Callback: ' . print_r($notification, true), 'M-Pesa-Callback');
         
         if (!isset($notification['Body']['stkCallback'])) {
-            throw new Exception('Invalid notification format');
+            throw new Exception('Invalid callback format - missing stkCallback');
         }
         
         $callback = $notification['Body']['stkCallback'];
         $checkout_request_id = $callback['CheckoutRequestID'] ?? '';
         
         if (empty($checkout_request_id)) {
-            throw new Exception('Missing CheckoutRequestID');
+            throw new Exception('Missing CheckoutRequestID in callback');
         }
         
-        // Find transaction
+        // Find the transaction
         $trx = ORM::for_table('tbl_payment_gateway')
             ->where('pg_token', $checkout_request_id)
             ->find_one();
             
         if (!$trx) {
-            throw new Exception('Transaction not found');
+            throw new Exception('Transaction not found for CheckoutRequestID: ' . $checkout_request_id);
         }
         
+        // Update transaction with callback data
         $trx->pg_paid_response = $request_body;
         
         if ($callback['ResultCode'] == 0) {
@@ -414,12 +424,14 @@ function mpesastk_payment_notification()
             $payment_data = [];
             
             foreach ($metadata as $item) {
-                $payment_data[$item['Name']] = $item['Value'] ?? null;
+                if (isset($item['Name'], $item['Value'])) {
+                    $payment_data[$item['Name']] = $item['Value'];
+                }
             }
             
             $trx->pg_paid_date = date('Y-m-d H:i:s');
             $trx->paid_date = date('Y-m-d H:i:s');
-            $trx->pg_payment_id = $payment_data['MpesaReceiptNumber'] ?? '';
+            $trx->pg_payment_id = $payment_data['MpesaReceiptNumber'] ?? 'N/A';
             $trx->pg_payment_method = 'M-Pesa';
             $trx->status = 1; // Paid
             $trx->save();
@@ -427,21 +439,30 @@ function mpesastk_payment_notification()
             // Process successful payment
             mpesastk_process_successful_payment($trx);
             
-            _log('Payment Successful - TRX: ' . $trx->id . ', Receipt: ' . $trx->pg_payment_id, 'M-Pesa');
+            _log('Payment Successful - TRX ID: ' . $trx->id . ', Receipt: ' . $trx->pg_payment_id, 'M-Pesa');
         } else {
             // Failed payment
             $trx->status = 3; // Failed
             $trx->pg_message = $callback['ResultDesc'] ?? 'Payment failed';
             $trx->save();
             
-            _log('Payment Failed - TRX: ' . $trx->id . ', Reason: ' . $trx->pg_message, 'M-Pesa');
+            _log('Payment Failed - TRX ID: ' . $trx->id . ', Reason: ' . $trx->pg_message, 'M-Pesa');
         }
         
-        echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Success']);
+        // Return success response to M-Pesa
+        echo json_encode([
+            'ResultCode' => 0,
+            'ResultDesc' => 'Callback processed successfully'
+        ]);
         
     } catch (Exception $e) {
-        _log('Notification Error: ' . $e->getMessage(), 'M-Pesa');
-        echo json_encode(['ResultCode' => 1, 'ResultDesc' => $e->getMessage()]);
+        _log('Callback Processing Error: ' . $e->getMessage(), 'M-Pesa-Error');
+        
+        // Return error response to M-Pesa
+        echo json_encode([
+            'ResultCode' => 1,
+            'ResultDesc' => 'Error: ' . $e->getMessage()
+        ]);
     }
 }
 
@@ -458,7 +479,6 @@ function mpesastk_process_successful_payment($trx)
             throw new Exception('User or plan not found');
         }
         
-        $date_now = date("Y-m-d H:i:s");
         $date_exp = date("Y-m-d", strtotime("+{$plan['validity']} day"));
         
         // Add to Mikrotik if enabled
@@ -500,7 +520,7 @@ function mpesastk_process_successful_payment($trx)
         _log('User Activated - ' . $user['username'] . ' on ' . $plan['name_plan'], 'M-Pesa');
         
     } catch (Exception $e) {
-        _log('Payment Processing Error: ' . $e->getMessage(), 'M-Pesa');
+        _log('Payment Processing Error: ' . $e->getMessage(), 'M-Pesa-Error');
         throw $e;
     }
 }
@@ -557,7 +577,7 @@ function mpesastk_get_status($trx, $user)
         }
         
     } catch (Exception $e) {
-        _log('Status Check Error: ' . $e->getMessage(), 'M-Pesa');
+        _log('Status Check Error: ' . $e->getMessage(), 'M-Pesa-Error');
         r2(U . 'order/view/' . $trx['id'], 'e', $e->getMessage());
     }
 }
@@ -626,7 +646,7 @@ function mpesastk_check_status($checkout_request_id)
         return $result;
         
     } catch (Exception $e) {
-        _log('Status Query Error: ' . $e->getMessage(), 'M-Pesa');
+        _log('Status Query Error: ' . $e->getMessage(), 'M-Pesa-Error');
         return [
             'success' => false,
             'message' => $e->getMessage()
