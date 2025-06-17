@@ -188,12 +188,30 @@ function mpesastk_initiate_stk_push($phone, $amount, $reference)
         'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest' : 
         'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
     
-    $token = mpesastk_get_token();
-    
-    if (!$token) {
+    try {
+        $token = mpesastk_get_token();
+        
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "Token retrieved: " . ($token ? 'Success' : 'Failed') . "\n", FILE_APPEND);
+        }
+        
+        if (!$token) {
+            if (isset($log_file)) {
+                @file_put_contents($log_file, "Failed to get access token\n", FILE_APPEND);
+            }
+            return [
+                'success' => false,
+                'message' => 'Failed to get access token'
+            ];
+        }
+    } catch (Exception $e) {
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "ERROR getting token: " . $e->getMessage() . "\n", FILE_APPEND);
+        }
+        _log('Error getting token: ' . $e->getMessage(), 'M-Pesa');
         return [
             'success' => false,
-            'message' => 'Failed to get access token'
+            'message' => 'Error getting access token: ' . $e->getMessage()
         ];
     }
     
@@ -222,22 +240,30 @@ function mpesastk_initiate_stk_push($phone, $amount, $reference)
     // For GCP VM, ensure we have a full URL with domain name
     $callback_url = U . 'callback/mpesastk';
     
-    // If running on a server, make sure the callback URL is a full URL
-    if (strpos($callback_url, 'http') !== 0) {
-        // Try to detect the domain from server variables
-        $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' || $_SERVER['SERVER_PORT'] == 443) ? "https://" : "http://";
-        $domain = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
-        
-        // Get the base path of the application
-        $script_name = $_SERVER['SCRIPT_NAME'] ?? '';
-        $base_path = '';
-        
-        if (!empty($script_name)) {
-            $base_path = dirname(dirname($script_name));
-            $base_path = ($base_path == '/' || $base_path == '\\') ? '' : $base_path;
+    try {
+        // If running on a server, make sure the callback URL is a full URL
+        if (strpos($callback_url, 'http') !== 0) {
+            // Try to detect the domain from server variables
+            $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' || $_SERVER['SERVER_PORT'] == 443) ? "https://" : "http://";
+            $domain = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
+            
+            // Get the base path of the application
+            $script_name = $_SERVER['SCRIPT_NAME'] ?? '';
+            $base_path = '';
+            
+            if (!empty($script_name)) {
+                $base_path = dirname(dirname($script_name));
+                $base_path = ($base_path == '/' || $base_path == '\\') ? '' : $base_path;
+            }
+            
+            // Ensure we have a valid callback URL
+            $callback_url = $protocol . $domain . $base_path . '/callback/mpesastk';
         }
-        
-        $callback_url = $protocol . $domain . $base_path . '/callback/mpesastk';
+    } catch (Exception $e) {
+        // If there's an error constructing the callback URL, log it and use the default
+        _log('Error constructing callback URL: ' . $e->getMessage(), 'M-Pesa');
+        // Use a hardcoded URL as fallback
+        $callback_url = 'https://' . ($_SERVER['HTTP_HOST'] ?? 'your-domain.com') . '/callback/mpesastk';
     }
     
     // Log the callback URL for debugging
@@ -417,6 +443,7 @@ function mpesastk_create_transaction($trx, $user)
         
         r2(U . 'order/view/' . $trx['id'], 'e', 'An internal error occurred. Please try again or contact support.');
     }
+    }
 }
 
 /**
@@ -435,13 +462,18 @@ function mpesastk_payment_notification()
         _log('M-Pesa STK Push Notification Received: ' . $request_body, 'M-Pesa');
         
         // Create a debug log file for troubleshooting
-        $log_file = __DIR__ . '/../../logs/mpesa_callback_' . date('Ymd_His') . '.log';
-        file_put_contents($log_file, "Request Body: \n" . $request_body . "\n\n");
+        $log_dir = __DIR__ . '/../../logs';
+        // Create logs directory if it doesn't exist
+        if (!is_dir($log_dir)) {
+            @mkdir($log_dir, 0755, true);
+        }
+        $log_file = $log_dir . '/mpesa_callback_' . date('Ymd_His') . '.log';
+        @file_put_contents($log_file, "Request Body: \n" . $request_body . "\n\n");
         
         // Validate JSON
         if (empty($request_body)) {
             _log('M-Pesa STK Push Notification - Empty request body', 'M-Pesa');
-            file_put_contents($log_file, "Error: Empty request body\n", FILE_APPEND);
+            @file_put_contents($log_file, "Error: Empty request body\n", FILE_APPEND);
             echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Empty request body']);
             return;
         }
@@ -449,20 +481,20 @@ function mpesastk_payment_notification()
         $notification = json_decode($request_body, true);
         if (json_last_error() !== JSON_ERROR_NONE) {
             _log('M-Pesa STK Push Notification - Invalid JSON: ' . json_last_error_msg(), 'M-Pesa');
-            file_put_contents($log_file, "Error: Invalid JSON - " . json_last_error_msg() . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "Error: Invalid JSON - " . json_last_error_msg() . "\n", FILE_APPEND);
             echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Invalid JSON']);
             return;
         }
         
         // Log the parsed notification for debugging
-        file_put_contents($log_file, "Parsed Notification: \n" . print_r($notification, true) . "\n\n", FILE_APPEND);
+        @file_put_contents($log_file, "Parsed Notification: \n" . print_r($notification, true) . "\n\n", FILE_APPEND);
         
         if (isset($notification['Body']['stkCallback'])) {
             $callback = $notification['Body']['stkCallback'];
             $checkout_request_id = $callback['CheckoutRequestID'];
             
             // Log the checkout request ID
-            file_put_contents($log_file, "CheckoutRequestID: " . $checkout_request_id . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "CheckoutRequestID: " . $checkout_request_id . "\n", FILE_APPEND);
             
             // Find the transaction by checkout request ID
             $trx = ORM::for_table('tbl_payment_gateway')
@@ -471,11 +503,11 @@ function mpesastk_payment_notification()
             
             if ($trx) {
                 // Log transaction found
-                file_put_contents($log_file, "Transaction found: ID=" . $trx->id . "\n", FILE_APPEND);
+                @file_put_contents($log_file, "Transaction found: ID=" . $trx->id . "\n", FILE_APPEND);
                 
                 // Check if transaction is already processed (to prevent double processing)
                 if ($trx->status == 1) {
-                    file_put_contents($log_file, "Transaction already processed. Skipping.\n", FILE_APPEND);
+                    @file_put_contents($log_file, "Transaction already processed. Skipping.\n", FILE_APPEND);
                     echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Transaction already processed']);
                     return;
                 }
@@ -484,7 +516,7 @@ function mpesastk_payment_notification()
                 $trx->pg_paid_response = $request_body;
                 
                 if ($callback['ResultCode'] == 0) {
-                    file_put_contents($log_file, "Payment successful. Processing...\n", FILE_APPEND);
+                    @file_put_contents($log_file, "Payment successful. Processing...\n", FILE_APPEND);
                     // Payment successful
                     $item = $callback['CallbackMetadata']['Item'];
                     $amount = null;
@@ -514,9 +546,9 @@ function mpesastk_payment_notification()
                     // Process the successful payment
                     try {
                         mpesastk_process_successful_payment($trx);
-                        file_put_contents($log_file, "Payment processed successfully\n", FILE_APPEND);
+                        @file_put_contents($log_file, "Payment processed successfully\n", FILE_APPEND);
                     } catch (Exception $pe) {
-                        file_put_contents($log_file, "Error processing payment: " . $pe->getMessage() . "\n", FILE_APPEND);
+                        @file_put_contents($log_file, "Error processing payment: " . $pe->getMessage() . "\n", FILE_APPEND);
                         _log('M-Pesa Payment Processing Error - TRX ID: ' . $trx->id . ', Error: ' . $pe->getMessage(), 'M-Pesa');
                     }
                     
@@ -527,20 +559,20 @@ function mpesastk_payment_notification()
                     $trx->pg_message = $callback['ResultDesc'];
                     $trx->save();
                     
-                    file_put_contents($log_file, "Payment failed: " . $callback['ResultDesc'] . "\n", FILE_APPEND);
+                    @file_put_contents($log_file, "Payment failed: " . $callback['ResultDesc'] . "\n", FILE_APPEND);
                     _log('M-Pesa Payment Failed - TRX ID: ' . $trx->id . ', Reason: ' . $callback['ResultDesc'], 'M-Pesa');
                 }
             } else {
-                file_put_contents($log_file, "Transaction not found for CheckoutRequestID: " . $checkout_request_id . "\n", FILE_APPEND);
+                @file_put_contents($log_file, "Transaction not found for CheckoutRequestID: " . $checkout_request_id . "\n", FILE_APPEND);
                 _log('M-Pesa Notification - Transaction not found for CheckoutRequestID: ' . $checkout_request_id, 'M-Pesa');
             }
         } else {
-            file_put_contents($log_file, "Invalid callback format - missing stkCallback\n", FILE_APPEND);
+            @file_put_contents($log_file, "Invalid callback format - missing stkCallback\n", FILE_APPEND);
             _log('M-Pesa Notification - Invalid callback format - missing stkCallback', 'M-Pesa');
         }
         
         // Return a success response
-        file_put_contents($log_file, "Returning success response\n", FILE_APPEND);
+        @file_put_contents($log_file, "Returning success response\n", FILE_APPEND);
         echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Success']);
         
     } catch (Exception $e) {
@@ -548,11 +580,19 @@ function mpesastk_payment_notification()
         $error_message = 'M-Pesa Notification Exception: ' . $e->getMessage() . ' in ' . $e->getFile() . ' on line ' . $e->getLine();
         _log($error_message, 'M-Pesa');
         
-        // Log to the debug file if it exists
-        if (isset($log_file)) {
-            file_put_contents($log_file, "Exception: " . $error_message . "\n", FILE_APPEND);
-            file_put_contents($log_file, "Stack trace: " . $e->getTraceAsString() . "\n", FILE_APPEND);
+        // Create a log file for this exception if it doesn't exist
+        if (!isset($log_file)) {
+            $log_dir = __DIR__ . '/../../logs';
+            // Create logs directory if it doesn't exist
+            if (!is_dir($log_dir)) {
+                @mkdir($log_dir, 0755, true);
+            }
+            $log_file = $log_dir . '/mpesa_error_' . date('Ymd_His') . '.log';
         }
+        
+        // Log to the debug file
+        @file_put_contents($log_file, "Exception: " . $error_message . "\n", FILE_APPEND);
+        @file_put_contents($log_file, "Stack trace: " . $e->getTraceAsString() . "\n", FILE_APPEND);
         
         echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Internal server error']);
     }
@@ -563,9 +603,28 @@ function mpesastk_payment_notification()
  */
 function mpesastk_process_successful_payment($trx)
 {
+    // Create a log file for debugging
+    try {
+        $log_dir = __DIR__ . '/../../logs';
+        // Create logs directory if it doesn't exist
+        if (!is_dir($log_dir)) {
+            @mkdir($log_dir, 0755, true);
+        }
+        $log_file = $log_dir . '/mpesa_payment_' . date('Ymd_His') . '_' . $trx->id . '.log';
+        @file_put_contents($log_file, "Processing payment for transaction ID: " . $trx->id . "\n");
+    } catch (Exception $e) {
+        // Silently continue if logging fails
+        $log_file = null;
+    }
     try {
         $user = ORM::for_table('tbl_customers')->find_one($trx->customer_id);
         $plan = ORM::for_table('tbl_plans')->find_one($trx->plan_id);
+        
+        // Log user and plan details
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "User ID: " . ($user ? $user->id : 'Not found') . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "Plan ID: " . ($plan ? $plan->id : 'Not found') . "\n", FILE_APPEND);
+        }
         
         if ($plan && $user) {
             $date_now = date("Y-m-d H:i:s");
@@ -575,13 +634,38 @@ function mpesastk_process_successful_payment($trx)
             
             // Add to Mikrotik if enabled
             if (!empty($trx->routers)) {
-                $mikrotik = Mikrotik::info($trx->routers);
-                if ($mikrotik && $mikrotik['enabled'] == '1') {
-                    if ($plan['type'] == 'Hotspot') {
-                        Mikrotik::addHotspotUser($mikrotik, $user['username'], $plan, $user['password']);
-                    } else if ($plan['type'] == 'PPPOE') {
-                        Mikrotik::addPpoeUser($mikrotik, $user['username'], $plan, $user['password']);
+                if (isset($log_file)) {
+                    @file_put_contents($log_file, "Router: " . $trx->routers . "\n", FILE_APPEND);
+                }
+                
+                try {
+                    $mikrotik = Mikrotik::info($trx->routers);
+                    if ($mikrotik && $mikrotik['enabled'] == '1') {
+                        if (isset($log_file)) {
+                            @file_put_contents($log_file, "Mikrotik enabled, type: " . $plan['type'] . "\n", FILE_APPEND);
+                        }
+                        
+                        if ($plan['type'] == 'Hotspot') {
+                            Mikrotik::addHotspotUser($mikrotik, $user['username'], $plan, $user['password']);
+                            if (isset($log_file)) {
+                                @file_put_contents($log_file, "Added Hotspot user: " . $user['username'] . "\n", FILE_APPEND);
+                            }
+                        } else if ($plan['type'] == 'PPPOE') {
+                            Mikrotik::addPpoeUser($mikrotik, $user['username'], $plan, $user['password']);
+                            if (isset($log_file)) {
+                                @file_put_contents($log_file, "Added PPPOE user: " . $user['username'] . "\n", FILE_APPEND);
+                            }
+                        }
+                    } else {
+                        if (isset($log_file)) {
+                            @file_put_contents($log_file, "Mikrotik not enabled or not found\n", FILE_APPEND);
+                        }
                     }
+                } catch (Exception $me) {
+                    if (isset($log_file)) {
+                        @file_put_contents($log_file, "Mikrotik error: " . $me->getMessage() . "\n", FILE_APPEND);
+                    }
+                    _log('M-Pesa Mikrotik Error - TRX ID: ' . $trx->id . ', Error: ' . $me->getMessage(), 'M-Pesa');
                 }
             }
             
@@ -613,7 +697,13 @@ function mpesastk_process_successful_payment($trx)
             _log('User activated successfully - User: ' . $user['username'] . ', Plan: ' . $plan['name_plan'], 'M-Pesa');
         }
     } catch (Exception $e) {
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "ERROR: " . $e->getMessage() . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "File: " . $e->getFile() . " Line: " . $e->getLine() . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "Stack Trace: " . $e->getTraceAsString() . "\n", FILE_APPEND);
+        }
         _log('Error processing successful payment: ' . $e->getMessage(), 'M-Pesa');
+        return false;
     }
 }
 
@@ -622,45 +712,138 @@ function mpesastk_process_successful_payment($trx)
  */
 function mpesastk_get_status($trx, $user)
 {
+    // Create a log file for debugging
+    try {
+        $log_dir = __DIR__ . '/../../logs';
+        // Create logs directory if it doesn't exist
+        if (!is_dir($log_dir)) {
+            @mkdir($log_dir, 0755, true);
+        }
+        $log_file = $log_dir . '/mpesa_status_' . date('Ymd_His') . '_' . $trx['id'] . '.log';
+        @file_put_contents($log_file, "Checking payment status for transaction ID: " . $trx['id'] . "\n");
+        @file_put_contents($log_file, "User ID: " . ($user ? $user['id'] : 'Not provided') . "\n", FILE_APPEND);
+        @file_put_contents($log_file, "PG Token: " . ($trx['pg_token'] ?? 'Not found') . "\n", FILE_APPEND);
+    } catch (Exception $e) {
+        // Silently continue if logging fails
+        $log_file = null;
+    }
     if (empty($trx['pg_token'])) {
         r2(U . 'order/view/' . $trx['id'], 'e', 'No checkout request ID found');
     }
     
-    $response = mpesastk_check_status($trx['pg_token']);
-    
-    $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
-    $d->pg_check_data = json_encode($response);
+    try {
+        $response = mpesastk_check_status($trx['pg_token']);
+        
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "Status check response: " . json_encode($response) . "\n", FILE_APPEND);
+        }
+        
+        $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
+        if (!$d) {
+            if (isset($log_file)) {
+                @file_put_contents($log_file, "ERROR: Transaction not found in database: " . $trx['id'] . "\n", FILE_APPEND);
+            }
+            r2(U . 'order/view/' . $trx['id'], 'e', 'Transaction not found');
+            return;
+        }
+        $d->pg_check_data = json_encode($response);
     
     if (isset($response['ResultCode'])) {
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "Result Code: " . $response['ResultCode'] . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "Result Description: " . ($response['ResultDesc'] ?? 'Not provided') . "\n", FILE_APPEND);
+        }
+        
         if ($response['ResultCode'] == 0) {
             // Payment successful
-            $d->pg_paid_response = json_encode($response);
-            $d->pg_paid_date = date('Y-m-d H:i:s');
-            $d->paid_date = date('Y-m-d H:i:s');
-            $d->status = 1; // Paid
-            $d->save();
+            if (isset($log_file)) {
+                @file_put_contents($log_file, "Payment successful, updating transaction...\n", FILE_APPEND);
+            }
             
-            // Process the successful payment
-            mpesastk_process_successful_payment($d);
-            
-            r2(U . 'order/view/' . $trx['id'], 's', 'Payment successful');
+            try {
+                $d->pg_paid_response = json_encode($response);
+                $d->pg_paid_date = date('Y-m-d H:i:s');
+                $d->paid_date = date('Y-m-d H:i:s');
+                $d->status = 1; // Paid
+                $d->save();
+                
+                if (isset($log_file)) {
+                    @file_put_contents($log_file, "Transaction updated, processing payment...\n", FILE_APPEND);
+                }
+                
+                // Process the successful payment
+                $result = mpesastk_process_successful_payment($d);
+                
+                if (isset($log_file)) {
+                    @file_put_contents($log_file, "Payment processing result: " . ($result === false ? "Failed" : "Success") . "\n", FILE_APPEND);
+                }
+                
+                r2(U . 'order/view/' . $trx['id'], 's', 'Payment successful');
+            } catch (Exception $e) {
+                if (isset($log_file)) {
+                    @file_put_contents($log_file, "ERROR updating transaction: " . $e->getMessage() . "\n", FILE_APPEND);
+                    @file_put_contents($log_file, "File: " . $e->getFile() . " Line: " . $e->getLine() . "\n", FILE_APPEND);
+                }
+                _log('Error updating transaction: ' . $e->getMessage(), 'M-Pesa');
+                r2(U . 'order/view/' . $trx['id'], 'e', 'An internal error occurred while processing payment.');
+            }
         } else {
             // Payment failed or pending
-            $d->pg_message = $response['ResultDesc'];
-            if ($response['ResultCode'] != 1032) { // 1032 means request is in progress
-                $d->status = 3; // Failed
+            if (isset($log_file)) {
+                @file_put_contents($log_file, "Payment not successful, code: " . $response['ResultCode'] . "\n", FILE_APPEND);
             }
-            $d->save();
             
-            if ($response['ResultCode'] == 1032) {
-                r2(U . 'order/view/' . $trx['id'], 'w', 'Payment is still pending. Please complete the payment on your phone.');
-            } else {
-                r2(U . 'order/view/' . $trx['id'], 'e', 'Payment status: ' . $response['ResultDesc']);
+            try {
+                $d->pg_message = $response['ResultDesc'];
+                if ($response['ResultCode'] != 1032) { // 1032 means request is in progress
+                    $d->status = 3; // Failed
+                    if (isset($log_file)) {
+                        @file_put_contents($log_file, "Setting status to Failed\n", FILE_APPEND);
+                    }
+                } else {
+                    if (isset($log_file)) {
+                        @file_put_contents($log_file, "Payment still pending\n", FILE_APPEND);
+                    }
+                }
+                $d->save();
+                
+                if ($response['ResultCode'] == 1032) {
+                    r2(U . 'order/view/' . $trx['id'], 'w', 'Payment is still pending. Please complete the payment on your phone.');
+                } else {
+                    r2(U . 'order/view/' . $trx['id'], 'e', 'Payment status: ' . $response['ResultDesc']);
+                }
+            } catch (Exception $e) {
+                if (isset($log_file)) {
+                    @file_put_contents($log_file, "ERROR updating transaction: " . $e->getMessage() . "\n", FILE_APPEND);
+                    @file_put_contents($log_file, "File: " . $e->getFile() . " Line: " . $e->getLine() . "\n", FILE_APPEND);
+                }
+                _log('Error updating transaction: ' . $e->getMessage(), 'M-Pesa');
+                r2(U . 'order/view/' . $trx['id'], 'e', 'An internal error occurred while processing payment status.');
             }
         }
     } else {
-        $d->save();
-        r2(U . 'order/view/' . $trx['id'], 'e', 'Failed to check payment status');
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "No ResultCode in response\n", FILE_APPEND);
+        }
+        try {
+            $d->save();
+            r2(U . 'order/view/' . $trx['id'], 'e', 'Failed to check payment status');
+        } catch (Exception $e) {
+            if (isset($log_file)) {
+                @file_put_contents($log_file, "ERROR saving transaction: " . $e->getMessage() . "\n", FILE_APPEND);
+            }
+            _log('Error saving transaction: ' . $e->getMessage(), 'M-Pesa');
+            r2(U . 'order/view/' . $trx['id'], 'e', 'An internal error occurred while checking payment status.');
+        }
+    }
+    } catch (Exception $e) {
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "CRITICAL ERROR in get_status: " . $e->getMessage() . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "File: " . $e->getFile() . " Line: " . $e->getLine() . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "Stack Trace: " . $e->getTraceAsString() . "\n", FILE_APPEND);
+        }
+        _log('Critical error in get_status: ' . $e->getMessage(), 'M-Pesa');
+        r2(U . 'order/view/' . $trx['id'], 'e', 'An internal error occurred. Please try again or contact support.');
     }
 }
 
@@ -669,6 +852,19 @@ function mpesastk_get_status($trx, $user)
  */
 function mpesastk_check_status($checkout_request_id)
 {
+    // Create a log file for debugging
+    try {
+        $log_dir = __DIR__ . '/../../logs';
+        // Create logs directory if it doesn't exist
+        if (!is_dir($log_dir)) {
+            @mkdir($log_dir, 0755, true);
+        }
+        $log_file = $log_dir . '/mpesa_check_status_' . date('Ymd_His') . '_' . substr($checkout_request_id, 0, 10) . '.log';
+        @file_put_contents($log_file, "Checking status for CheckoutRequestID: " . $checkout_request_id . "\n");
+    } catch (Exception $e) {
+        // Silently continue if logging fails
+        $log_file = null;
+    }
     $config = mpesastk_get_config();
     $environment = $config['environment'] ?? 'sandbox';
     
@@ -676,49 +872,141 @@ function mpesastk_check_status($checkout_request_id)
         'https://sandbox.safaricom.co.ke/mpesa/stkpushquery/v1/query' : 
         'https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query';
     
-    $token = mpesastk_get_token();
-    
-    if (!$token) {
+    try {
+        $token = mpesastk_get_token();
+        
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "Token retrieved: " . ($token ? 'Success' : 'Failed') . "\n", FILE_APPEND);
+        }
+        
+        if (!$token) {
+            if (isset($log_file)) {
+                @file_put_contents($log_file, "Failed to get access token\n", FILE_APPEND);
+            }
+            return [
+                'success' => false,
+                'message' => 'Failed to get access token'
+            ];
+        }
+    } catch (Exception $e) {
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "ERROR getting token: " . $e->getMessage() . "\n", FILE_APPEND);
+        }
+        _log('Error getting token: ' . $e->getMessage(), 'M-Pesa');
         return [
             'success' => false,
-            'message' => 'Failed to get access token'
+            'message' => 'Error getting access token: ' . $e->getMessage()
         ];
     }
     
-    // Generate timestamp
-    $timestamp = date('YmdHis');
-    
-    // Generate password
-    $password = base64_encode($config['business_shortcode'] . $config['passkey'] . $timestamp);
-    
-    // Prepare request data
-    $data = [
-        'BusinessShortCode' => (int)$config['business_shortcode'],
-        'Password' => $password,
-        'Timestamp' => $timestamp,
-        'CheckoutRequestID' => $checkout_request_id
-    ];
-    
-    $ch = curl_init($query_url);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Authorization: Bearer ' . $token,
-        'Content-Type: application/json'
-    ]);
-    curl_setopt($ch, CURLOPT_POST, 1);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    
-    $response = curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    try {
+        // Generate timestamp
+        $timestamp = date('YmdHis');
+        
+        // Generate password
+        $password = base64_encode($config['business_shortcode'] . $config['passkey'] . $timestamp);
+        
+        // Prepare request data
+        $data = [
+            'BusinessShortCode' => (int)$config['business_shortcode'],
+            'Password' => $password,
+            'Timestamp' => $timestamp,
+            'CheckoutRequestID' => $checkout_request_id
+        ];
+        
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "Request data: " . json_encode($data, JSON_PRETTY_PRINT) . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "API URL: " . $query_url . "\n", FILE_APPEND);
+        }
+        
+        $ch = curl_init($query_url);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Authorization: Bearer ' . $token,
+            'Content-Type: application/json'
+        ]);
+        curl_setopt($ch, CURLOPT_POST, 1);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        
+        $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "HTTP Code: " . $http_code . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "Response: " . $response . "\n", FILE_APPEND);
+        }
+        
+        if ($response === false) {
+            $curl_error = curl_error($ch);
+            if (isset($log_file)) {
+                @file_put_contents($log_file, "CURL Error: " . $curl_error . "\n", FILE_APPEND);
+            }
+            _log('CURL Error in check_status: ' . $curl_error, 'M-Pesa');
+            return [
+                'success' => false,
+                'message' => 'CURL Error: ' . $curl_error
+            ];
+        }
+    } catch (Exception $e) {
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "ERROR in API call: " . $e->getMessage() . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "File: " . $e->getFile() . " Line: " . $e->getLine() . "\n", FILE_APPEND);
+        }
+        _log('Error in API call: ' . $e->getMessage(), 'M-Pesa');
+        return [
+            'success' => false,
+            'message' => 'Error in API call: ' . $e->getMessage()
+        ];
+    }
     curl_close($ch);
     
     // Log the response for debugging
     _log('M-Pesa Status Check Response - HTTP Code: ' . $http_code . ', Response: ' . $response, 'M-Pesa');
     
-    $result = json_decode($response, true);
-    return $result ?: ['success' => false, 'message' => 'Invalid response'];
+    try {
+        if ($http_code != 200) {
+            if (isset($log_file)) {
+                @file_put_contents($log_file, "HTTP Error: " . $http_code . "\n", FILE_APPEND);
+            }
+            return [
+                'success' => false,
+                'message' => 'HTTP Error: ' . $http_code
+            ];
+        }
+        
+        $result = json_decode($response, true);
+        
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            $json_error = json_last_error_msg();
+            if (isset($log_file)) {
+                @file_put_contents($log_file, "JSON Error: " . $json_error . "\n", FILE_APPEND);
+                @file_put_contents($log_file, "Raw Response: " . $response . "\n", FILE_APPEND);
+            }
+            _log('JSON Error in check_status: ' . $json_error, 'M-Pesa');
+            return [
+                'success' => false,
+                'message' => 'JSON Error: ' . $json_error
+            ];
+        }
+        
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "Parsed Result: " . json_encode($result, JSON_PRETTY_PRINT) . "\n", FILE_APPEND);
+        }
+        
+        return $result;
+    } catch (Exception $e) {
+        if (isset($log_file)) {
+            @file_put_contents($log_file, "ERROR processing response: " . $e->getMessage() . "\n", FILE_APPEND);
+            @file_put_contents($log_file, "File: " . $e->getFile() . " Line: " . $e->getLine() . "\n", FILE_APPEND);
+        }
+        _log('Error processing response: ' . $e->getMessage(), 'M-Pesa');
+        return [
+            'success' => false,
+            'message' => 'Error processing response: ' . $e->getMessage()
+        ];
+    }
 }
 
 ?>
