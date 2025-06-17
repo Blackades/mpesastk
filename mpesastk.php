@@ -2,7 +2,7 @@
 
 /**
  *  PHP Mikrotik Billing 
- *  M-Pesa Bank STK Push API Integration - FIXED VERSION
+ *  M-Pesa Bank STK Push API Integration - IMPROVED VERSION
  **/
 
 // Register the callback handler - ADD THIS AT THE TOP
@@ -315,7 +315,13 @@ function mpesastk_create_transaction($trx, $user)
         
         // Format phone for display
         $display_phone = substr($phone, 0, 6) . 'XXX';
-        r2(U . 'order/view/' . $trx['id'], 's', 'STK Push sent to your phone ' . $display_phone . '. Please complete the payment on your phone.');
+        
+        // Return success response without redirecting
+        return [
+            'success' => true,
+            'message' => 'STK Push sent to your phone ' . $display_phone . '. Please complete the payment on your phone.',
+            'checkout_request_id' => $response['CheckoutRequestID']
+        ];
     } else {
         $error_msg = 'Failed to initiate STK Push';
         if (isset($response['errorMessage'])) {
@@ -328,12 +334,15 @@ function mpesastk_create_transaction($trx, $user)
         $d->status = 3; // Failed
         $d->save();
         
-        r2(U . 'order/view/' . $trx['id'], 'e', $error_msg);
+        return [
+            'success' => false,
+            'message' => $error_msg
+        ];
     }
 }
 
 /**
- * Handles the payment notification from M-Pesa - FIXED VERSION
+ * Handles the payment notification from M-Pesa - IMPROVED VERSION
  */
 function mpesastk_payment_notification()
 {
