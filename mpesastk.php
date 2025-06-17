@@ -264,71 +264,94 @@ function mpesastk_initiate_stk_push($phone, $amount, $reference)
 }
 
 /**
- * Initiates a payment transaction with M-Pesa Bank STK Push
+ * Initiates a payment transaction with M-Pesa Bank STK Push - FIXED VERSION
  */
 function mpesastk_create_transaction($trx, $user)
 {
-    // Validate configuration first
-    $config = mpesastk_validate_config();
-    
-    // Get user's phone number
-    $phone = $user['phonenumber'];
-    
-    // If phone number is empty, use the one from the form
-    if (empty($phone)) {
-        $phone = _post('phone');
-    }
-    
-    if (empty($phone)) {
-        r2(U . 'order/view/' . $trx['id'], 'e', 'Phone number is required for M-Pesa payment');
-    }
-    
-    // Format and validate phone number
-    $phone = preg_replace('/[^0-9+]/', '', $phone); // Remove non-numeric characters except +
-    
-    // Validate amount
-    if ($trx['price'] <= 0) {
-        r2(U . 'order/view/' . $trx['id'], 'e', 'Invalid amount');
-    }
-    
-    // Initiate STK Push
-    $response = mpesastk_initiate_stk_push($phone, $trx['price'], $trx['id']);
-    
-    // Update transaction record
-    $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
-    if (!$d) {
-        r2(U . 'order/view/' . $trx['id'], 'e', 'Transaction not found');
-    }
-    
-    $d->pg_request_data = json_encode([
-        'phone' => $phone,
-        'amount' => $trx['price'],
-        'reference' => $trx['id']
-    ]);
-    $d->pg_raw_data = json_encode($response);
-    
-    if (isset($response['CheckoutRequestID']) && $response['success']) {
-        $d->pg_token = $response['CheckoutRequestID'];
-        $d->pg_url_payment = U . 'order/view/' . $trx['id'];
-        $d->status = 2; // Pending
-        $d->save();
+    try {
+        // Validate configuration first
+        $config = mpesastk_validate_config();
         
-        // Format phone for display
-        $display_phone = substr($phone, 0, 6) . 'XXX';
-        r2(U . 'order/view/' . $trx['id'], 's', 'STK Push sent to your phone ' . $display_phone . '. Please complete the payment on your phone.');
-    } else {
-        $error_msg = 'Failed to initiate STK Push';
-        if (isset($response['errorMessage'])) {
-            $error_msg .= ': ' . $response['errorMessage'];
-        } elseif (isset($response['message'])) {
-            $error_msg .= ': ' . $response['message'];
+        // Get user's phone number
+        $phone = $user['phonenumber'];
+        
+        // If phone number is empty, use the one from the form
+        if (empty($phone)) {
+            $phone = _post('phone');
         }
         
-        $d->pg_message = $error_msg;
-        $d->status = 3; // Failed
-        $d->save();
+        if (empty($phone)) {
+            r2(U . 'order/view/' . $trx['id'], 'e', 'Phone number is required for M-Pesa payment');
+            return;
+        }
         
-        r2(U . 'order/view/' . $trx['id'], 'e', $error_msg);
+        // Format and validate phone number
+        $phone = preg_replace('/[^0-9+]/', '', $phone); // Remove non-numeric characters except +
+        
+        // Validate amount
+        if ($trx['price'] <= 0) {
+            r2(U . 'order/view/' . $trx['id'], 'e', 'Invalid amount');
+            return;
+        }
+        
+        // Find the transaction record first
+        $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
+        if (!$d) {
+            r2(U . 'order/view/' . $trx['id'], 'e', 'Transaction not found');
+            return;
+        }
+        
+        // Initiate STK Push
+        $response = mpesastk_initiate_stk_push($phone, $trx['price'], $trx['id']);
+        
+        // Update transaction record
+        $d->pg_request_data = json_encode([
+            'phone' => $phone,
+            'amount' => $trx['price'],
+            'reference' => $trx['id']
+        ]);
+        $d->pg_raw_data = json_encode($response);
+        
+        if (isset($response['CheckoutRequestID']) && $response['success']) {
+            $d->pg_token = $response['CheckoutRequestID'];
+            $d->pg_url_payment = U . 'order/view/' . $trx['id'];
+            $d->status = 2; // Pending
+            $d->save();
+            
+            // Format phone for display
+            $display_phone = substr($phone, 0, 6) . 'XXX';
+            r2(U . 'order/view/' . $trx['id'], 's', 'STK Push sent to your phone ' . $display_phone . '. Please complete the payment on your phone.');
+        } else {
+            $error_msg = 'Failed to initiate STK Push';
+            if (isset($response['errorMessage'])) {
+                $error_msg .= ': ' . $response['errorMessage'];
+            } elseif (isset($response['message'])) {
+                $error_msg .= ': ' . $response['message'];
+            }
+            
+            $d->pg_message = $error_msg;
+            $d->status = 3; // Failed
+            $d->save();
+            
+            r2(U . 'order/view/' . $trx['id'], 'e', $error_msg);
+        }
+    } catch (Exception $e) {
+        // Log the exception
+        _log('M-Pesa Create Transaction Exception: ' . $e->getMessage() . ' - Line: ' . $e->getLine(), 'M-Pesa');
+        
+        // Update transaction status to failed
+        try {
+            $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
+            if ($d) {
+                $d->pg_message = 'Internal error: ' . $e->getMessage();
+                $d->status = 3; // Failed
+                $d->save();
+            }
+        } catch (Exception $e2) {
+            _log('M-Pesa Save Exception: ' . $e2->getMessage(), 'M-Pesa');
+        }
+        
+        r2(U . 'order/view/' . $trx['id'], 'e', 'An internal error occurred. Please try again or contact support.');
     }
 }
 
@@ -428,7 +451,7 @@ function mpesastk_payment_notification()
 }
 
 /**
- * Process successful payment - Add user to system
+ * Process successful payment - Add user to system - FIXED VERSION
  */
 function mpesastk_process_successful_payment($trx)
 {
@@ -589,3 +612,5 @@ function mpesastk_check_status($checkout_request_id)
     $result = json_decode($response, true);
     return $result ?: ['success' => false, 'message' => 'Invalid response'];
 }
+
+?>
