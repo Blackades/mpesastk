@@ -5,15 +5,9 @@
  * M-Pesa Bank STK Push API Integration - FIXED VERSION
  **/
 
-// Register the callback handler
-if (isset($_GET['_route']) && $_GET['_route'] == 'callback/mpesastk') {
-    if (!defined('MPESA_CALLBACK_PROCESSING')) {
-        define('MPESA_CALLBACK_PROCESSING', true);
-        mpesastk_payment_notification();
-    }
-    exit;
-}
-
+/**
+ * Displays the configuration form for M-Pesa Bank STK Push
+ */
 function mpesastk_show_config()
 {
     global $ui;
@@ -34,6 +28,9 @@ function mpesastk_show_config()
     $ui->display('paymentgateway/mpesastk.tpl');
 }
 
+/**
+ * Saves the M-Pesa Bank STK Push configuration
+ */
 function mpesastk_save_config()
 {
     global $admin;
@@ -79,38 +76,57 @@ function mpesastk_save_config()
     }
 }
 
-function mpesastk_get_config() {
-    static $mpesastk_config = null;
-    
-    if ($mpesastk_config === null) {
-        $config = ORM::for_table('tbl_appconfig')->where('setting', 'mpesastk_config')->find_one();
-        $mpesastk_config = $config ? json_decode($config['value'], true) : [];
-    }
-    
-    return $mpesastk_config;
+// M-Pesa Bank STK Push API Configuration
+$mpesastk_config = [];
+$config = ORM::for_table('tbl_appconfig')->where('setting', 'mpesastk_config')->find_one();
+if ($config) {
+    $mpesastk_config = json_decode($config['value'], true);
 }
 
+$mpesastk_consumer_key = $mpesastk_config['consumer_key'] ?? '';
+$mpesastk_consumer_secret = $mpesastk_config['consumer_secret'] ?? '';
+$mpesastk_business_shortcode = $mpesastk_config['business_shortcode'] ?? '';
+$mpesastk_passkey = $mpesastk_config['passkey'] ?? '';
+$mpesastk_callback_url = U . 'callback/mpesastk';
+$mpesastk_environment = $mpesastk_config['environment'] ?? 'sandbox';
+$mpesastk_account_reference = $mpesastk_config['account_reference'] ?? 'PHPNuxBill';
+$mpesastk_transaction_desc = $mpesastk_config['transaction_desc'] ?? 'Payment for Internet Access';
+
+// API URLs
+$mpesastk_auth_url = $mpesastk_environment == 'sandbox' ? 
+    'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials' : 
+    'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
+
+$mpesastk_stkpush_url = $mpesastk_environment == 'sandbox' ? 
+    'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest' : 
+    'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
+
+$mpesastk_query_url = $mpesastk_environment == 'sandbox' ? 
+    'https://sandbox.safaricom.co.ke/mpesa/stkpushquery/v1/query' : 
+    'https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query';
+
+/**
+ * Validates the M-Pesa Bank STK Push configuration
+ */
 function mpesastk_validate_config()
 {
-    $config = mpesastk_get_config();
-    if (empty($config['consumer_key']) || empty($config['consumer_secret']) || empty($config['business_shortcode'])) {
-        r2(U . 'paymentgateway', 'e', 'M-Pesa Bank STK Push Payment Gateway is not configured yet');
+    global $mpesastk_consumer_key, $mpesastk_consumer_secret, $mpesastk_business_shortcode;
+    
+    if (empty($mpesastk_consumer_key) || empty($mpesastk_consumer_secret) || empty($mpesastk_business_shortcode)) {
+        r2(U . 'paymentgateway', 'e', 'M-Pesa Bank STK Push Payment Gateway is not properly configured');
     }
-    return $config;
 }
 
+/**
+ * Gets an access token from the M-Pesa API
+ */
 function mpesastk_get_token()
 {
-    $config = mpesastk_get_config();
-    $environment = $config['environment'] ?? 'sandbox';
+    global $mpesastk_auth_url, $mpesastk_consumer_key, $mpesastk_consumer_secret;
     
-    $auth_url = $environment == 'sandbox' ? 
-        'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials' : 
-        'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
+    $credentials = base64_encode($mpesastk_consumer_key . ':' . $mpesastk_consumer_secret);
     
-    $credentials = base64_encode($config['consumer_key'] . ':' . $config['consumer_secret']);
-    
-    $ch = curl_init($auth_url);
+    $ch = curl_init($mpesastk_auth_url);
     curl_setopt($ch, CURLOPT_HTTPHEADER, [
         'Authorization: Basic ' . $credentials
     ]);
@@ -123,7 +139,8 @@ function mpesastk_get_token()
     $curl_error = curl_error($ch);
     curl_close($ch);
     
-    _log('M-Pesa Token Request - HTTP Code: ' . $http_code . ', Response: ' . substr($response, 0, 200) . ', Error: ' . $curl_error, 'M-Pesa');
+    // Log the response for debugging
+    _log('M-Pesa Token Request - HTTP Code: ' . $http_code . ', Response: ' . $response . ', Error: ' . $curl_error, 'M-Pesa');
     
     if ($curl_error) {
         _log('M-Pesa Token CURL Error: ' . $curl_error, 'M-Pesa');
@@ -145,87 +162,59 @@ function mpesastk_get_token()
     return null;
 }
 
+/**
+ * Initiates an STK Push request to the customer's phone
+ */
 function mpesastk_initiate_stk_push($phone, $amount, $reference)
 {
-    // Check for existing pending transaction
-    $existing = ORM::for_table('tbl_payment_gateway')
-        ->where('id', $reference)
-        ->where('status', 2)
-        ->where_not_equal('pg_token', '')
-        ->find_one();
+    global $mpesastk_stkpush_url, $mpesastk_business_shortcode, $mpesastk_passkey, 
+           $mpesastk_account_reference, $mpesastk_transaction_desc, $mpesastk_callback_url;
     
-    if ($existing) {
+    $token = mpesastk_get_token();
+    
+    if (!$token) {
         return [
             'success' => false,
-            'message' => 'A payment request is already in progress',
-            'CheckoutRequestID' => $existing->pg_token
+            'message' => 'Failed to get access token from M-Pesa API'
         ];
     }
     
-    $config = mpesastk_get_config();
-    $environment = $config['environment'] ?? 'sandbox';
+    // Format phone number (remove leading 0 or +254 and add 254)
+    $phone = preg_replace('/^0/', '254', preg_replace('/^\+254/', '254', $phone));
     
-    $stkpush_url = $environment == 'sandbox' ? 
-        'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest' : 
-        'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
-    
-    try {
-        $token = mpesastk_get_token();
-        
-        if (!$token) {
-            return [
-                'success' => false,
-                'message' => 'Failed to get access token'
-            ];
-        }
-    } catch (Exception $e) {
-        _log('Error getting token: ' . $e->getMessage(), 'M-Pesa');
-        return [
-            'success' => false,
-            'message' => 'Error getting access token: ' . $e->getMessage()
-        ];
-    }
-    
-    // Format phone number
-    $phone = preg_replace('/^\+/', '', $phone);
-    $phone = preg_replace('/^0/', '254', $phone);
-    if (!preg_match('/^254/', $phone)) {
-        $phone = '254' . $phone;
-    }
-    
+    // Validate phone number format
     if (!preg_match('/^254[0-9]{9}$/', $phone)) {
         return [
             'success' => false,
-            'message' => 'Invalid phone number format'
+            'message' => 'Invalid phone number format. Expected format: 254XXXXXXXXX'
         ];
     }
     
+    // Generate timestamp
     $timestamp = date('YmdHis');
-    $password = base64_encode($config['business_shortcode'] . $config['passkey'] . $timestamp);
     
-    // Build callback URL
-    $callback_url = U . 'callback/mpesastk';
-    if (strpos($callback_url, 'http') !== 0) {
-        $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' || $_SERVER['SERVER_PORT'] == 443) ? "https://" : "http://";
-        $domain = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
-        $callback_url = $protocol . $domain . $callback_url;
-    }
+    // Generate password
+    $password = base64_encode($mpesastk_business_shortcode . $mpesastk_passkey . $timestamp);
     
+    // Prepare request data - FIXED: Ensure all values are correct types
     $data = [
-        'BusinessShortCode' => (int)$config['business_shortcode'],
+        'BusinessShortCode' => (int)$mpesastk_business_shortcode,
         'Password' => $password,
         'Timestamp' => $timestamp,
         'TransactionType' => 'CustomerPayBillOnline',
         'Amount' => (int)round($amount),
         'PartyA' => (int)$phone,
-        'PartyB' => (int)$config['business_shortcode'],
+        'PartyB' => (int)$mpesastk_business_shortcode,
         'PhoneNumber' => (int)$phone,
-        'CallBackURL' => $callback_url,
-        'AccountReference' => ($config['account_reference'] ?? 'PHPNuxBill') . '-' . $reference,
-        'TransactionDesc' => $config['transaction_desc'] ?? 'Payment for Internet Access'
+        'CallBackURL' => $mpesastk_callback_url,
+        'AccountReference' => substr($mpesastk_account_reference . '-' . $reference, 0, 12), // Max 12 chars
+        'TransactionDesc' => substr($mpesastk_transaction_desc, 0, 13) // Max 13 chars
     ];
     
-    $ch = curl_init($stkpush_url);
+    // Log the request data for debugging
+    _log('M-Pesa STK Push Request: ' . json_encode($data), 'M-Pesa');
+    
+    $ch = curl_init($mpesastk_stkpush_url);
     curl_setopt($ch, CURLOPT_HTTPHEADER, [
         'Authorization: Bearer ' . $token,
         'Content-Type: application/json'
@@ -241,7 +230,8 @@ function mpesastk_initiate_stk_push($phone, $amount, $reference)
     $curl_error = curl_error($ch);
     curl_close($ch);
     
-    _log('M-Pesa STK Push Response - HTTP Code: ' . $http_code . ', Response: ' . substr($response, 0, 500), 'M-Pesa');
+    // Log the response for debugging
+    _log('M-Pesa STK Push Response - HTTP Code: ' . $http_code . ', Response: ' . $response . ', Error: ' . $curl_error, 'M-Pesa');
     
     if ($curl_error) {
         return [
@@ -252,325 +242,351 @@ function mpesastk_initiate_stk_push($phone, $amount, $reference)
     
     $result = json_decode($response, true);
     
-    if (json_last_error() !== JSON_ERROR_NONE) {
+    if (!$result) {
         return [
             'success' => false,
             'message' => 'Invalid JSON response from M-Pesa API'
         ];
     }
     
-    if (isset($result['CheckoutRequestID'])) {
+    // Add success flag based on response
+    if (isset($result['ResponseCode']) && $result['ResponseCode'] == '0' && isset($result['CheckoutRequestID'])) {
         $result['success'] = true;
     } else {
         $result['success'] = false;
+        if (isset($result['errorMessage'])) {
+            $result['message'] = $result['errorMessage'];
+        } elseif (isset($result['ResponseDescription'])) {
+            $result['message'] = $result['ResponseDescription'];
+        } else {
+            $result['message'] = 'Unknown error occurred';
+        }
     }
     
     return $result;
 }
 
+/**
+ * Checks the status of an STK Push request
+ */
+function mpesastk_check_status($checkout_request_id)
+{
+    global $mpesastk_query_url, $mpesastk_business_shortcode, $mpesastk_passkey;
+    
+    $token = mpesastk_get_token();
+    
+    if (!$token) {
+        return [
+            'success' => false,
+            'message' => 'Failed to get access token'
+        ];
+    }
+    
+    // Generate timestamp
+    $timestamp = date('YmdHis');
+    
+    // Generate password
+    $password = base64_encode($mpesastk_business_shortcode . $mpesastk_passkey . $timestamp);
+    
+    // Prepare request data
+    $data = [
+        'BusinessShortCode' => (int)$mpesastk_business_shortcode,
+        'Password' => $password,
+        'Timestamp' => $timestamp,
+        'CheckoutRequestID' => $checkout_request_id
+    ];
+    
+    $ch = curl_init($mpesastk_query_url);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Authorization: Bearer ' . $token,
+        'Content-Type: application/json'
+    ]);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    
+    $response = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    
+    // Log the response for debugging
+    _log('M-Pesa Status Check Response - HTTP Code: ' . $http_code . ', Response: ' . $response, 'M-Pesa');
+    
+    $result = json_decode($response, true);
+    return $result ?: ['success' => false, 'message' => 'Invalid response'];
+}
+
+/**
+ * Initiates a payment transaction with M-Pesa Bank STK Push
+ */
 function mpesastk_create_transaction($trx, $user)
 {
-    try {
-        $config = mpesastk_validate_config();
+    // Validate configuration first
+    mpesastk_validate_config();
+    
+    // Get user's phone number
+    $phone = $user['phonenumber'];
+    
+    // If phone number is empty, use the one from the form
+    if (empty($phone)) {
+        $phone = _post('phone');
+    }
+    
+    if (empty($phone)) {
+        r2(U . 'order/view/' . $trx['id'], 'e', 'Phone number is required for M-Pesa payment');
+    }
+    
+    // Format and validate phone number
+    $phone = preg_replace('/[^0-9]/', '', $phone); // Remove non-numeric characters
+    $phone = preg_replace('/^0/', '254', $phone); // Convert 0 to 254
+    $phone = preg_replace('/^254254/', '254', $phone); // Fix double 254
+    
+    if (!preg_match('/^254[0-9]{9}$/', $phone)) {
+        r2(U . 'order/view/' . $trx['id'], 'e', 'Invalid phone number format. Please use format 254XXXXXXXXX, 07XXXXXXXX or +254XXXXXXXXX');
+    }
+    
+    // Validate amount
+    if ($trx['price'] <= 0) {
+        r2(U . 'order/view/' . $trx['id'], 'e', 'Invalid amount');
+    }
+    
+    // Initiate STK Push
+    $response = mpesastk_initiate_stk_push($phone, $trx['price'], $trx['id']);
+    
+    // Update transaction record
+    $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
+    if (!$d) {
+        r2(U . 'order/view/' . $trx['id'], 'e', 'Transaction not found');
+    }
+    
+    $d->pg_request_data = json_encode([
+        'phone' => $phone,
+        'amount' => $trx['price'],
+        'reference' => $trx['id']
+    ]);
+    $d->pg_raw_data = json_encode($response);
+    
+    if (isset($response['CheckoutRequestID']) && $response['success']) {
+        $d->pg_token = $response['CheckoutRequestID'];
+        $d->pg_url_payment = U . 'order/view/' . $trx['id'];
+        $d->status = 2; // Pending
+        $d->save();
         
-        $phone = $user['phonenumber'] ?? _post('phone');
-        
-        if (empty($phone)) {
-            r2(U . 'order/view/' . $trx['id'], 'e', 'Phone number is required');
-            return;
+        r2(U . 'order/view/' . $trx['id'], 's', 'STK Push sent to your phone ' . substr($phone, 0, 6) . 'XXX. Please complete the payment on your phone.');
+    } else {
+        $error_msg = 'Failed to initiate STK Push';
+        if (isset($response['errorMessage'])) {
+            $error_msg .= ': ' . $response['errorMessage'];
+        } elseif (isset($response['message'])) {
+            $error_msg .= ': ' . $response['message'];
+        } elseif (isset($response['ResponseDescription'])) {
+            $error_msg .= ': ' . $response['ResponseDescription'];
         }
         
-        if ($trx['price'] <= 0) {
-            r2(U . 'order/view/' . $trx['id'], 'e', 'Invalid amount');
-            return;
-        }
+        $d->pg_message = $error_msg;
+        $d->status = 3; // Failed
+        $d->save();
         
-        $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
-        if (!$d) {
-            r2(U . 'order/view/' . $trx['id'], 'e', 'Transaction not found');
-            return;
-        }
-        
-        if ($d->status == 2 && !empty($d->pg_token)) {
-            $display_phone = substr($phone, 0, 6) . 'XXX';
-            r2(U . 'order/view/' . $trx['id'], 's', 'STK Push already sent to ' . $display_phone);
-            return;
-        }
-        
-        $response = mpesastk_initiate_stk_push($phone, $trx['price'], $trx['id']);
-        
-        $d->pg_request_data = json_encode([
-            'phone' => $phone,
-            'amount' => $trx['price'],
-            'reference' => $trx['id']
-        ]);
-        $d->pg_raw_data = json_encode($response);
-        
-        if (isset($response['CheckoutRequestID'])) {
-            if ($response['success']) {
-                $d->pg_token = $response['CheckoutRequestID'];
-                $d->pg_url_payment = U . 'order/view/' . $trx['id'];
-                $d->status = 2;
-                $d->save();
-                
-                r2(U . 'order/view/' . $trx['id'], 's', 'STK Push sent to your phone');
-            } else {
-                $d->pg_token = $response['CheckoutRequestID'];
-                $d->save();
-                
-                r2(U . 'order/view/' . $trx['id'], 's', 'Payment request in progress');
-            }
-        } else {
-            $error_msg = $response['message'] ?? 'Failed to initiate STK Push';
-            $d->pg_message = $error_msg;
-            $d->status = 3;
-            $d->save();
-            
-            r2(U . 'order/view/' . $trx['id'], 'e', $error_msg);
-        }
-    } catch (Exception $e) {
-        _log('M-Pesa Create Transaction Error: ' . $e->getMessage(), 'M-Pesa');
-        
-        try {
-            $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
-            if ($d) {
-                $d->pg_message = 'Internal error: ' . $e->getMessage();
-                $d->status = 3;
-                $d->save();
-            }
-        } catch (Exception $e2) {
-            _log('M-Pesa Save Error: ' . $e2->getMessage(), 'M-Pesa');
-        }
-        
-        r2(U . 'order/view/' . $trx['id'], 'e', 'An error occurred. Please try again.');
+        r2(U . 'order/view/' . $trx['id'], 'e', $error_msg);
     }
 }
 
+/**
+ * Handles the payment notification from M-Pesa
+ */
 function mpesastk_payment_notification()
 {
+    // Get the request body
+    $request_body = file_get_contents('php://input');
+    
+    // Log the notification
+    _log('M-Pesa STK Push Notification Received: ' . $request_body, 'M-Pesa');
+    
+    // Validate JSON
+    $notification = json_decode($request_body, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        _log('M-Pesa STK Push Notification - Invalid JSON: ' . json_last_error_msg(), 'M-Pesa');
+        header('Content-Type: application/json');
+        echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Invalid JSON']);
+        exit;
+    }
+    
+    // Ensure proper JSON response headers
     header('Content-Type: application/json');
     
-    try {
-        $request_body = file_get_contents('php://input');
-        _log('M-Pesa Notification: ' . $request_body, 'M-Pesa');
+    if (isset($notification['Body']['stkCallback'])) {
+        $callback = $notification['Body']['stkCallback'];
+        $checkout_request_id = $callback['CheckoutRequestID'] ?? '';
         
-        if (empty($request_body)) {
-            echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Empty request']);
-            return;
+        if (empty($checkout_request_id)) {
+            echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Missing CheckoutRequestID']);
+            exit;
         }
         
-        $notification = json_decode($request_body, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Invalid JSON']);
-            return;
-        }
+        // Find the transaction by checkout request ID
+        $trx = ORM::for_table('tbl_payment_gateway')
+            ->where('pg_token', $checkout_request_id)
+            ->find_one();
         
-        if (isset($notification['Body']['stkCallback'])) {
-            $callback = $notification['Body']['stkCallback'];
-            $checkout_request_id = $callback['CheckoutRequestID'];
+        if ($trx) {
+            // Update the transaction with the notification data
+            $trx->pg_paid_response = $request_body;
             
-            $trx = ORM::for_table('tbl_payment_gateway')
-                ->where('pg_token', $checkout_request_id)
-                ->find_one();
-            
-            if ($trx) {
-                $trx->pg_paid_response = $request_body;
+            if ($callback['ResultCode'] == 0) {
+                // Payment successful
+                $item = $callback['CallbackMetadata']['Item'] ?? [];
+                $amount = null;
+                $mpesa_receipt_number = null;
+                $transaction_date = null;
+                $phone_number = null;
                 
-                if ($callback['ResultCode'] == 0) {
-                    $item = $callback['CallbackMetadata']['Item'];
-                    $receipt_number = null;
-                    
-                    foreach ($item as $meta) {
-                        if ($meta['Name'] == 'MpesaReceiptNumber') {
-                            $receipt_number = $meta['Value'];
-                            break;
-                        }
+                foreach ($item as $meta) {
+                    if ($meta['Name'] == 'Amount') {
+                        $amount = $meta['Value'] ?? null;
+                    } else if ($meta['Name'] == 'MpesaReceiptNumber') {
+                        $mpesa_receipt_number = $meta['Value'] ?? null;
+                    } else if ($meta['Name'] == 'TransactionDate') {
+                        $transaction_date = $meta['Value'] ?? null;
+                    } else if ($meta['Name'] == 'PhoneNumber') {
+                        $phone_number = $meta['Value'] ?? null;
                     }
-                    
-                    $trx->pg_paid_date = date('Y-m-d H:i:s');
-                    $trx->paid_date = date('Y-m-d H:i:s');
-                    $trx->pg_payment_id = $receipt_number;
-                    $trx->pg_payment_method = 'M-Pesa';
-                    $trx->status = 1;
-                    $trx->save();
-                    
-                    mpesastk_process_successful_payment($trx);
-                    _log('Payment Successful - TRX ID: ' . $trx->id, 'M-Pesa');
-                } else {
-                    $trx->status = 3;
-                    $trx->pg_message = $callback['ResultDesc'];
-                    $trx->save();
-                    _log('Payment Failed - TRX ID: ' . $trx->id, 'M-Pesa');
                 }
+                
+                $trx->pg_paid_date = date('Y-m-d H:i:s');
+                $trx->paid_date = date('Y-m-d H:i:s');
+                $trx->pg_payment_id = $mpesa_receipt_number;
+                $trx->pg_payment_method = 'M-Pesa';
+                $trx->status = 1; // Paid
+                $trx->save();
+                
+                // Process the successful payment
+                mpesastk_process_successful_payment($trx);
+                
+                _log('M-Pesa Payment Successful - TRX ID: ' . $trx->id . ', Receipt: ' . $mpesa_receipt_number, 'M-Pesa');
+                echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Success']);
+                exit;
+            } else {
+                // Payment failed
+                $trx->status = 3; // Failed
+                $trx->pg_message = $callback['ResultDesc'] ?? 'Payment failed';
+                $trx->save();
+                
+                _log('M-Pesa Payment Failed - TRX ID: ' . $trx->id . ', Reason: ' . ($callback['ResultDesc'] ?? 'Unknown'), 'M-Pesa');
+                echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Success']);
+                exit;
             }
+        } else {
+            _log('M-Pesa Notification - Transaction not found for CheckoutRequestID: ' . $checkout_request_id, 'M-Pesa');
+            echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Success']);
+            exit;
         }
-        
-        echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Success']);
-    } catch (Exception $e) {
-        _log('Notification Error: ' . $e->getMessage(), 'M-Pesa');
-        echo json_encode(['ResultCode' => 1, 'ResultDesc' => 'Error processing']);
     }
+    
+    // Default response if no callback data
+    echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Success']);
+    exit;
 }
 
+/**
+ * Process successful payment - Add user to system
+ */
 function mpesastk_process_successful_payment($trx)
 {
-    try {
-        $user = ORM::for_table('tbl_customers')->find_one($trx->customer_id);
-        $plan = ORM::for_table('tbl_plans')->find_one($trx->plan_id);
+    $user = ORM::for_table('tbl_customers')->find_one($trx->customer_id);
+    $plan = ORM::for_table('tbl_plans')->find_one($trx->plan_id);
+    
+    if ($plan && $user) {
+        $date_now = date("Y-m-d H:i:s");
+        $date_only = date("Y-m-d");
+        $time = date("H:i:s");
+        $date_exp = date("Y-m-d", strtotime("+{$plan['validity']} day"));
         
-        if ($plan && $user) {
-            $date_exp = date("Y-m-d", strtotime("+{$plan['validity']} day"));
-            
-            if (!empty($trx->routers)) {
-                try {
-                    $mikrotik = Mikrotik::info($trx->routers);
-                    if ($mikrotik && $mikrotik['enabled'] == '1') {
-                        if ($plan['type'] == 'Hotspot') {
-                            Mikrotik::addHotspotUser($mikrotik, $user['username'], $plan, $user['password']);
-                        } else if ($plan['type'] == 'PPPOE') {
-                            Mikrotik::addPpoeUser($mikrotik, $user['username'], $plan, $user['password']);
-                        }
-                    }
-                } catch (Exception $me) {
-                    _log('Mikrotik Error: ' . $me->getMessage(), 'M-Pesa');
+        // Add to Mikrotik if enabled
+        if (!empty($trx->routers)) {
+            $mikrotik = Mikrotik::info($trx->routers);
+            if ($mikrotik && $mikrotik['enabled'] == '1') {
+                if ($plan['type'] == 'Hotspot') {
+                    Mikrotik::addHotspotUser($mikrotik, $user['username'], $plan, $user['password']);
+                } else if ($plan['type'] == 'PPPOE') {
+                    Mikrotik::addPpoeUser($mikrotik, $user['username'], $plan, $user['password']);
                 }
             }
-            
-            Balance::plus($user['id'], $plan['price']);
-            
-            $recharge = ORM::for_table('tbl_user_recharges')->create();
-            $recharge->customer_id = $user['id'];
-            $recharge->username = $user['username'];
-            $recharge->plan_id = $plan['id'];
-            $recharge->namebp = $plan['name_plan'];
-            $recharge->recharged_on = date("Y-m-d");
-            $recharge->recharged_time = date("H:i:s");
-            $recharge->expiration = $date_exp;
-            $recharge->time = $plan['validity'];
-            $recharge->amount = $plan['price'];
-            $recharge->gateway = 'M-Pesa STK Push';
-            $recharge->payment_method = 'M-Pesa';
-            $recharge->routers = $trx->routers;
-            $recharge->type = 'Customer';
-            $recharge->save();
-            
-            $u = ORM::for_table('tbl_customers')->find_one($user['id']);
-            $u->expiration = $date_exp;
-            $u->save();
         }
-    } catch (Exception $e) {
-        _log('Payment Processing Error: ' . $e->getMessage(), 'M-Pesa');
-        return false;
+        
+        // Update user's balance
+        Balance::plus($user['id'], $plan['price']);
+        
+        // Create recharge record
+        $recharge = ORM::for_table('tbl_user_recharges')->create();
+        $recharge->customer_id = $user['id'];
+        $recharge->username = $user['username'];
+        $recharge->plan_id = $plan['id'];
+        $recharge->namebp = $plan['name_plan'];
+        $recharge->recharged_on = $date_only;
+        $recharge->recharged_time = $time;
+        $recharge->expiration = $date_exp;
+        $recharge->time = $plan['validity'];
+        $recharge->amount = $plan['price'];
+        $recharge->gateway = 'M-Pesa Bank STK Push';
+        $recharge->payment_method = 'M-Pesa';
+        $recharge->routers = $trx->routers;
+        $recharge->type = 'Customer';
+        $recharge->save();
+        
+        // Update user's expiration date
+        $u = ORM::for_table('tbl_customers')->find_one($user['id']);
+        $u->expiration = $date_exp;
+        $u->save();
+        
+        _log('User activated successfully - User: ' . $user['username'] . ', Plan: ' . $plan['name_plan'], 'M-Pesa');
     }
 }
 
+/**
+ * Gets the status of a payment transaction
+ */
 function mpesastk_get_status($trx, $user)
 {
     if (empty($trx['pg_token'])) {
-        r2(U . 'order/view/' . $trx['id'], 'e', 'No checkout ID found');
+        r2(U . 'order/view/' . $trx['id'], 'e', 'No checkout request ID found');
     }
     
-    try {
-        $response = mpesastk_check_status($trx['pg_token']);
-        
-        $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
-        if (!$d) {
-            r2(U . 'order/view/' . $trx['id'], 'e', 'Transaction not found');
-            return;
-        }
-        
-        $d->pg_check_data = json_encode($response);
-        
-        if (isset($response['ResultCode'])) {
-            if ($response['ResultCode'] == 0) {
-                $d->pg_paid_response = json_encode($response);
-                $d->pg_paid_date = date('Y-m-d H:i:s');
-                $d->paid_date = date('Y-m-d H:i:s');
-                $d->status = 1;
-                $d->save();
-                
-                mpesastk_process_successful_payment($d);
-                r2(U . 'order/view/' . $trx['id'], 's', 'Payment successful');
-            } else {
-                $d->pg_message = $response['ResultDesc'];
-                if ($response['ResultCode'] != 1032) {
-                    $d->status = 3;
-                }
-                $d->save();
-                
-                if ($response['ResultCode'] == 1032) {
-                    r2(U . 'order/view/' . $trx['id'], 'w', 'Payment pending');
-                } else {
-                    r2(U . 'order/view/' . $trx['id'], 'e', $response['ResultDesc']);
-                }
-            }
-        } else {
+    $response = mpesastk_check_status($trx['pg_token']);
+    
+    $d = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
+    $d->pg_check_data = json_encode($response);
+    
+    if (isset($response['ResultCode'])) {
+        if ($response['ResultCode'] == 0) {
+            // Payment successful
+            $d->pg_paid_response = json_encode($response);
+            $d->pg_paid_date = date('Y-m-d H:i:s');
+            $d->paid_date = date('Y-m-d H:i:s');
+            $d->status = 1; // Paid
             $d->save();
-            r2(U . 'order/view/' . $trx['id'], 'e', 'Failed to check status');
+            
+            // Process the successful payment
+            mpesastk_process_successful_payment($d);
+            
+            r2(U . 'order/view/' . $trx['id'], 's', 'Payment successful');
+        } else {
+            // Payment failed or pending
+            $d->pg_message = $response['ResultDesc'] ?? 'Unknown error';
+            if ($response['ResultCode'] != 1032) { // 1032 means request is in progress
+                $d->status = 3; // Failed
+            }
+            $d->save();
+            
+            if ($response['ResultCode'] == 1032) {
+                r2(U . 'order/view/' . $trx['id'], 'w', 'Payment is still pending. Please complete the payment on your phone.');
+            } else {
+                r2(U . 'order/view/' . $trx['id'], 'e', 'Payment status: ' . ($response['ResultDesc'] ?? 'Unknown error'));
+            }
         }
-    } catch (Exception $e) {
-        _log('Status Check Error: ' . $e->getMessage(), 'M-Pesa');
-        r2(U . 'order/view/' . $trx['id'], 'e', 'Error checking status');
-    }
-}
-
-function mpesastk_check_status($checkout_request_id)
-{
-    $config = mpesastk_get_config();
-    $environment = $config['environment'] ?? 'sandbox';
-    
-    $query_url = $environment == 'sandbox' ? 
-        'https://sandbox.safaricom.co.ke/mpesa/stkpushquery/v1/query' : 
-        'https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query';
-    
-    try {
-        $token = mpesastk_get_token();
-        
-        if (!$token) {
-            return [
-                'success' => false,
-                'message' => 'Failed to get token'
-            ];
-        }
-        
-        $timestamp = date('YmdHis');
-        $password = base64_encode($config['business_shortcode'] . $config['passkey'] . $timestamp);
-        
-        $data = [
-            'BusinessShortCode' => (int)$config['business_shortcode'],
-            'Password' => $password,
-            'Timestamp' => $timestamp,
-            'CheckoutRequestID' => $checkout_request_id
-        ];
-        
-        $ch = curl_init($query_url);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Authorization: Bearer ' . $token,
-            'Content-Type: application/json'
-        ]);
-        curl_setopt($ch, CURLOPT_POST, 1);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-        
-        $response = curl_exec($ch);
-        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        
-        if ($http_code != 200) {
-            return [
-                'success' => false,
-                'message' => 'HTTP Error: ' . $http_code
-            ];
-        }
-        
-        return json_decode($response, true);
-    } catch (Exception $e) {
-        _log('Status Check Exception: ' . $e->getMessage(), 'M-Pesa');
-        return [
-            'success' => false,
-            'message' => 'Error: ' . $e->getMessage()
-        ];
+    } else {
+        $d->save();
+        r2(U . 'order/view/' . $trx['id'], 'e', 'Failed to check payment status');
     }
 }
