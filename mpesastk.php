@@ -376,7 +376,7 @@ function mpesastk_get_error_message($code)
 }
 
 /**
- * Create transaction with rate limiting
+ * Create a transaction with rate limiting
  */
 function mpesastk_create_transaction($trx, $user)
 {
@@ -439,21 +439,19 @@ function mpesastk_create_transaction($trx, $user)
 /**
  * Payment notification callback - DEBUGGABLE VERSION
  */
+/**
+ * Payment notification callback - NO IP VALIDATION (TESTING ONLY)
+ */
 function mpesastk_payment_notification()
 {
     header('Content-Type: application/json');
     $response = ['ResultCode' => 0, 'ResultDesc' => 'Callback processed successfully'];
     
     try {
-        // Allow test mode from localhost
-        $is_test = ($_SERVER['REMOTE_ADDR'] === '127.0.0.1' || $_SERVER['REMOTE_ADDR'] === '::1');
-        
-        if (!$is_test && !mpesastk_validate_callback_source()) {
-            throw new Exception('Unauthorized callback source: '.$_SERVER['REMOTE_ADDR']);
-        }
-
         $input = file_get_contents('php://input');
-        if (empty($input)) throw new Exception('Empty callback data');
+        if (empty($input)) {
+            throw new Exception('Empty callback data');
+        }
         
         _log("Raw Callback: $input", 'MPESA-CALLBACK');
         
@@ -462,7 +460,7 @@ function mpesastk_payment_notification()
             throw new Exception('Invalid JSON: '.json_last_error_msg());
         }
         
-        // Enhanced callback structure validation
+        // Validate callback structure
         if (!isset($data['Body']['stkCallback']['CheckoutRequestID'])) {
             throw new Exception('Invalid callback structure. Missing CheckoutRequestID');
         }
@@ -539,10 +537,10 @@ function mpesastk_payment_notification()
         }
         $response = [
             'ResultCode' => 1,
-            'ResultDesc' => $e->getMessage(), // Now shows actual error
+            'ResultDesc' => $e->getMessage(),
             'Debug' => [
-                'IP' => $_SERVER['REMOTE_ADDR'] ?? 'unknown',
-                'Time' => date('Y-m-d H:i:s')
+                'Time' => date('Y-m-d H:i:s'),
+                'Input' => $input ?? null
             ]
         ];
         _log("Callback Error: " . $e->getMessage(), 'MPESA-ERROR');
