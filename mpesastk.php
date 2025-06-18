@@ -321,7 +321,7 @@ function mpesastk_create_transaction($trx, $user)
 // ========================
 
 /**
- * Payment notification callback - NO IP VALIDATION (TESTING ONLY)
+ * Payment notification callback - NO IP VALIDATION & NO LOCKING (TESTING ONLY)
  */
 function mpesastk_payment_notification()
 {
@@ -349,12 +349,9 @@ function mpesastk_payment_notification()
         $callback = $data['Body']['stkCallback'];
         $checkout_id = $callback['CheckoutRequestID'];
         
-        // Begin transaction with locking
-        ORM::get_db()->beginTransaction();
-        
+        // Find transaction WITHOUT locking (since Idiorm doesn't support it)
         $trx = ORM::for_table('tbl_payment_gateway')
             ->where('pg_token', $checkout_id)
-            ->lock('FOR UPDATE')
             ->find_one();
             
         if (!$trx) {
@@ -363,7 +360,6 @@ function mpesastk_payment_notification()
         
         // Check if already processed
         if (!empty($trx->pg_paid_response)) {
-            ORM::get_db()->rollBack();
             throw new Exception('Callback already processed for this transaction');
         }
         
@@ -372,7 +368,6 @@ function mpesastk_payment_notification()
         if ($callback['ResultCode'] == 0) {
             // Verify transaction hasn't been processed already
             if ($trx->status == 1) {
-                ORM::get_db()->rollBack();
                 throw new Exception('Transaction already completed');
             }
             
@@ -394,28 +389,22 @@ function mpesastk_payment_notification()
             $trx->pg_payment_method = 'M-Pesa';
             
             if (!$trx->save()) {
-                ORM::get_db()->rollBack();
                 throw new Exception('Database error while updating transaction');
             }
             
             // Process payment
             mpesastk_process_successful_payment($trx);
             
-            ORM::get_db()->commit();
             _log("Payment Success: $checkout_id", 'MPESA-CALLBACK');
         } else {
             $trx->status = 3;
             $trx->pg_message = $callback['ResultDesc'] ?? 'Payment failed';
             $trx->save();
-            ORM::get_db()->commit();
             
             _log("Payment Failed: $checkout_id - " . $trx->pg_message, 'MPESA-CALLBACK');
         }
         
     } catch (Exception $e) {
-        if (ORM::get_db()->inTransaction()) {
-            ORM::get_db()->rollBack();
-        }
         $response = [
             'ResultCode' => 1,
             'ResultDesc' => $e->getMessage(),
