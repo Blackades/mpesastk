@@ -1,21 +1,20 @@
 <?php
-
 /**
  * PHP Mikrotik Billing 
- * M-Pesa Bank STK Push API Integration - FINAL WORKING VERSION
- **/
+ * Secure M-Pesa Bank STK Push API Integration
+ */
 
-// ========================
-// 1. CALLBACK ENTRY POINT
-// ========================
+// =============================================
+// 1. MAIN CALLBACK ENTRY POINT
+// =============================================
 if (isset($_GET['_route']) && $_GET['_route'] == 'callback/mpesastk') {
     mpesastk_payment_notification();
     exit;
 }
 
-// ========================
+// =============================================
 // 2. CONFIGURATION FUNCTIONS
-// ========================
+// =============================================
 
 /**
  * Display configuration form
@@ -55,7 +54,8 @@ function mpesastk_save_config()
         $required = [
             'mpesastk_consumer_key' => 'Consumer Key',
             'mpesastk_consumer_secret' => 'Consumer Secret',
-            'mpesastk_business_shortcode' => 'Business Shortcode'
+            'mpesastk_business_shortcode' => 'Business Shortcode',
+            'mpesastk_passkey' => 'Passkey'
         ];
         
         foreach ($required as $field => $name) {
@@ -65,13 +65,15 @@ function mpesastk_save_config()
         }
 
         $data = [
-            'consumer_key' => _post('mpesastk_consumer_key'),
-            'consumer_secret' => _post('mpesastk_consumer_secret'),
-            'business_shortcode' => _post('mpesastk_business_shortcode'),
-            'passkey' => _post('mpesastk_passkey'),
-            'environment' => _post('mpesastk_environment'),
-            'account_reference' => _post('mpesastk_account_reference'),
-            'transaction_desc' => _post('mpesastk_transaction_desc')
+            'consumer_key' => trim(_post('mpesastk_consumer_key')),
+            'consumer_secret' => trim(_post('mpesastk_consumer_secret')),
+            'business_shortcode' => trim(_post('mpesastk_business_shortcode')),
+            'passkey' => trim(_post('mpesastk_passkey')),
+            'environment' => in_array(_post('mpesastk_environment'), ['sandbox', 'production']) 
+                ? _post('mpesastk_environment') 
+                : 'sandbox',
+            'account_reference' => substr(trim(_post('mpesastk_account_reference')), 0, 12),
+            'transaction_desc' => substr(trim(_post('mpesastk_transaction_desc')), 0, 20)
         ];
 
         $record = ORM::for_table('tbl_appconfig')
@@ -94,9 +96,9 @@ function mpesastk_save_config()
     }
 }
 
-// ========================
-// 3. CORE MPESA FUNCTIONS
-// ========================
+// =============================================
+// 3. CORE MPESA FUNCTIONS WITH SECURITY ENHANCEMENTS
+// =============================================
 
 /**
  * Get M-Pesa configuration
@@ -119,16 +121,32 @@ function mpesastk_get_config()
         if (json_last_error() !== JSON_ERROR_NONE) {
             throw new Exception('Invalid configuration format');
         }
+        
+        // Validate required config values
+        $required = ['consumer_key', 'consumer_secret', 'business_shortcode', 'passkey'];
+        foreach ($required as $key) {
+            if (empty($config[$key])) {
+                throw new Exception("Missing required configuration: $key");
+            }
+        }
     }
     
     return $config;
 }
 
 /**
- * Get access token
+ * Get access token with caching
  */
 function mpesastk_get_token()
 {
+    static $token;
+    static $token_expiry;
+    
+    // Return cached token if still valid (5 minutes cache)
+    if ($token !== null && $token_expiry > time()) {
+        return $token;
+    }
+    
     $config = mpesastk_get_config();
     
     try {
@@ -142,7 +160,7 @@ function mpesastk_get_token()
         curl_setopt_array($ch, [
             CURLOPT_HTTPHEADER => ['Authorization: Basic ' . $credentials],
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_TIMEOUT => 30
         ]);
         
@@ -151,13 +169,17 @@ function mpesastk_get_token()
         $error = curl_error($ch);
         curl_close($ch);
         
-        if ($error) throw new Exception("CURL Error: $error");
-        if ($http_code != 200) throw new Exception("HTTP $http_code");
+        if ($error) throw new Exception("Payment service unavailable");
+        if ($http_code != 200) throw new Exception("Payment service error");
         
         $data = json_decode($response, true);
-        if (empty($data['access_token'])) throw new Exception("No access token");
+        if (empty($data['access_token'])) throw new Exception("Payment authentication failed");
         
-        return $data['access_token'];
+        // Cache token for 4 minutes (tokens expire after 5 minutes)
+        $token = $data['access_token'];
+        $token_expiry = time() + 240;
+        
+        return $token;
         
     } catch (Exception $e) {
         _log("Token Error: " . $e->getMessage(), 'MPESA');
@@ -166,39 +188,99 @@ function mpesastk_get_token()
 }
 
 /**
- * Format phone number
+ * Enhanced phone number validation
  */
 function mpesastk_format_phone($phone)
 {
     $phone = preg_replace('/[^0-9+]/', '', $phone);
     $phone = ltrim($phone, '+');
     
-    if (strpos($phone, '0') === 0) {
+    // Convert local format (07...) to international (2547...)
+    if (strpos($phone, '0') === 0 && strlen($phone) == 10) {
         $phone = '254' . substr($phone, 1);
     }
     
-    if (!preg_match('/^254\d{9}$/', $phone)) {
-        throw new Exception('Invalid phone format');
+    // Validate Kenyan mobile number format
+    if (!preg_match('/^254(7\d{8}|1\d{8})$/', $phone)) {
+        throw new Exception('Please enter a valid Kenyan mobile number (e.g. 07... or 2547...)');
+    }
+    
+    // Validate against known mobile prefixes
+    $prefixes = [
+        '25470', '25471', '25472', '25473', '25474', '25475', '25476', '25477', '25478', '25479', // Safaricom
+        '25411', '25410', // Telkom
+        '25401', // Airtel
+    ];
+    
+    $prefix = substr($phone, 0, 5);
+    if (!in_array($prefix, $prefixes)) {
+        throw new Exception('Please enter a valid mobile number from supported networks');
     }
     
     return $phone;
 }
 
-// ========================
-// 4. PAYMENT PROCESSING
-// ========================
+// =============================================
+// 4. PAYMENT PROCESSING WITH RATE LIMITING
+// =============================================
 
 /**
- * Initiate STK Push
+ * Check and enforce rate limiting
+ */
+function mpesastk_check_rate_limit($user_id, $phone)
+{
+    $config = mpesastk_get_config();
+    $limit = ($config['environment'] == 'sandbox') ? 10 : 3; // More lenient in sandbox
+    $window = 60; // 1 minute window
+    
+    // Clear old entries
+    ORM::for_table('tbl_payment_rate_limits')
+        ->where_lt('created_at', date('Y-m-d H:i:s', time() - $window))
+        ->delete_many();
+    
+    // Count recent attempts
+    $count = ORM::for_table('tbl_payment_rate_limits')
+        ->where('user_id', $user_id)
+        ->where('phone', $phone)
+        ->count();
+        
+    if ($count >= $limit) {
+        throw new Exception('Too many payment attempts. Please wait a few minutes and try again.');
+    }
+    
+    // Record new attempt
+    $record = ORM::for_table('tbl_payment_rate_limits')->create();
+    $record->user_id = $user_id;
+    $record->phone = $phone;
+    $record->created_at = date('Y-m-d H:i:s');
+    $record->save();
+}
+
+/**
+ * Initiate STK Push with enhanced validation
  */
 function mpesastk_initiate_stk_push($phone, $amount, $reference)
 {
     try {
         $config = mpesastk_get_config();
         $token = mpesastk_get_token();
-        if (!$token) throw new Exception('Failed to get token');
+        
+        if (!$token) {
+            throw new Exception('Payment service is currently unavailable. Please try again later.');
+        }
         
         $phone = mpesastk_format_phone($phone);
+        
+        // Validate amount
+        if (!is_numeric($amount)) {
+            throw new Exception('Invalid payment amount');
+        }
+        
+        $amount = (int)round($amount);
+        if ($amount < 10 || $amount > 70000) {
+            throw new Exception('Amount must be between KES 10 and KES 70,000');
+        }
+        
         $timestamp = date('YmdHis');
         $password = base64_encode($config['business_shortcode'] . $config['passkey'] . $timestamp);
         
@@ -207,13 +289,13 @@ function mpesastk_initiate_stk_push($phone, $amount, $reference)
             'Password' => $password,
             'Timestamp' => $timestamp,
             'TransactionType' => 'CustomerPayBillOnline',
-            'Amount' => (int)round($amount),
+            'Amount' => $amount,
             'PartyA' => (int)$phone,
             'PartyB' => (int)$config['business_shortcode'],
             'PhoneNumber' => (int)$phone,
             'CallBackURL' => U . 'callback/mpesastk',
-            'AccountReference' => ($config['account_reference'] ?? 'PHPNuxBill') . '-' . $reference,
-            'TransactionDesc' => $config['transaction_desc'] ?? 'Payment for Internet Access'
+            'AccountReference' => substr(($config['account_reference'] ?? 'PHPNuxBill') . '-' . $reference, 0, 12),
+            'TransactionDesc' => substr($config['transaction_desc'] ?? 'Payment for Internet Access', 0, 20)
         ];
         
         $url = ($config['environment'] == 'sandbox')
@@ -229,7 +311,7 @@ function mpesastk_initiate_stk_push($phone, $amount, $reference)
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => json_encode($data),
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_TIMEOUT => 60
         ]);
         
@@ -238,12 +320,23 @@ function mpesastk_initiate_stk_push($phone, $amount, $reference)
         $error = curl_error($ch);
         curl_close($ch);
         
-        if ($error) throw new Exception("CURL Error: $error");
-        if ($http_code != 200) throw new Exception("HTTP $http_code");
+        if ($error) {
+            throw new Exception('Payment service communication error');
+        }
+        
+        if ($http_code != 200) {
+            throw new Exception('Payment service is currently unavailable');
+        }
         
         $result = json_decode($response, true);
+        
+        if (isset($result['errorCode'])) {
+            $errorMessage = mpesastk_get_error_message($result['errorCode']);
+            throw new Exception($errorMessage);
+        }
+        
         if (empty($result['CheckoutRequestID'])) {
-            throw new Exception($result['errorMessage'] ?? 'STK Push failed');
+            throw new Exception('Payment request could not be initiated');
         }
         
         return [
@@ -263,22 +356,45 @@ function mpesastk_initiate_stk_push($phone, $amount, $reference)
 }
 
 /**
- * Create transaction
+ * Map M-Pesa error codes to user-friendly messages
+ */
+function mpesastk_get_error_message($code)
+{
+    $errors = [
+        '400.002.02' => 'Invalid payment request',
+        '400.002.05' => 'Duplicate transaction detected',
+        '400.002.06' => 'Transaction amount too low',
+        '400.002.07' => 'Transaction amount too high',
+        '500.001.1001' => 'Phone number not registered with M-Pesa',
+        '500.001.1002' => 'Insufficient account balance',
+        '500.001.1003' => 'Transaction declined by user',
+        '500.001.1004' => 'Transaction timed out',
+        '500.001.1005' => 'Invalid business shortcode'
+    ];
+    
+    return $errors[$code] ?? 'Payment processing failed. Please try again.';
+}
+
+/**
+ * Create transaction with rate limiting
  */
 function mpesastk_create_transaction($trx, $user)
 {
     try {
         if (empty($trx['id']) || empty($trx['price']) || $trx['price'] <= 0) {
-            throw new Exception('Invalid transaction');
+            throw new Exception('Invalid transaction request');
         }
         
         $phone = $user['phonenumber'] ?? _post('phone');
-        if (empty($phone)) throw new Exception('Phone number required');
+        if (empty($phone)) throw new Exception('Phone number is required');
+        
+        // Apply rate limiting
+        mpesastk_check_rate_limit($user['id'], $phone);
         
         $response = mpesastk_initiate_stk_push($phone, $trx['price'], $trx['id']);
         
         $record = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
-        if (!$record) throw new Exception('Transaction not found');
+        if (!$record) throw new Exception('Transaction record not found');
         
         $record->pg_request_data = json_encode([
             'phone' => $phone,
@@ -296,7 +412,7 @@ function mpesastk_create_transaction($trx, $user)
             
             return [
                 'success' => true,
-                'message' => 'STK Push sent to ' . substr($phone, 0, 6) . 'XXX',
+                'message' => 'Payment request sent to ' . substr($phone, 0, 6) . 'XXX',
                 'checkout_request_id' => $response['CheckoutRequestID']
             ];
         } else {
@@ -316,59 +432,67 @@ function mpesastk_create_transaction($trx, $user)
     }
 }
 
-// ========================
-// 5. CALLBACK PROCESSING
-// ========================
+// =============================================
+// 5. SECURE CALLBACK PROCESSING
+// =============================================
 
 /**
- * Payment notification callback - FINAL WORKING VERSION
+ * Secure payment notification callback
  */
 function mpesastk_payment_notification()
 {
-    // 1. Set headers
     header('Content-Type: application/json');
-    
-    // 2. Default response
-    $response = [
-        'ResultCode' => 0,
-        'ResultDesc' => 'Callback processed successfully'
-    ];
+    $response = ['ResultCode' => 0, 'ResultDesc' => 'Callback processed successfully'];
     
     try {
-        // 3. Get raw input
+        // Validate callback source
+        if (!mpesastk_validate_callback_source()) {
+            throw new Exception('Unauthorized callback source');
+        }
+
         $input = file_get_contents('php://input');
         if (empty($input)) throw new Exception('Empty callback data');
         
-        // 4. Log raw data
         _log("Raw Callback: $input", 'MPESA-CALLBACK');
         
-        // 5. Parse JSON
         $data = json_decode($input, true);
         if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('Invalid JSON: ' . json_last_error_msg());
-        }
-        
-        // 6. Validate structure
-        if (!isset($data['Body']['stkCallback'])) {
             throw new Exception('Invalid callback format');
         }
         
-        $callback = $data['Body']['stkCallback'];
-        $checkout_id = $callback['CheckoutRequestID'] ?? '';
-        if (empty($checkout_id)) throw new Exception('Missing CheckoutRequestID');
+        // Enhanced callback structure validation
+        if (!isset($data['Body']['stkCallback']['CheckoutRequestID'])) {
+            throw new Exception('Invalid callback structure');
+        }
         
-        // 7. Find transaction
+        $callback = $data['Body']['stkCallback'];
+        $checkout_id = $callback['CheckoutRequestID'];
+        
+        // Begin transaction with locking
+        ORM::get_db()->beginTransaction();
+        
         $trx = ORM::for_table('tbl_payment_gateway')
             ->where('pg_token', $checkout_id)
+            ->lock('FOR UPDATE') // Database-level locking
             ->find_one();
             
-        if (!$trx) throw new Exception("Transaction not found: $checkout_id");
+        if (!$trx) throw new Exception("Transaction not found");
         
-        // 8. Process callback
+        // Check if already processed
+        if (!empty($trx->pg_paid_response)) {
+            ORM::get_db()->rollBack();
+            throw new Exception('Callback already processed');
+        }
+        
         $trx->pg_paid_response = $input;
         
         if ($callback['ResultCode'] == 0) {
-            // Successful payment
+            // Verify transaction hasn't been processed already
+            if ($trx->status == 1) {
+                ORM::get_db()->rollBack();
+                throw new Exception('Transaction already completed');
+            }
+            
             $metadata = [];
             foreach ($callback['CallbackMetadata']['Item'] ?? [] as $item) {
                 if (isset($item['Name'], $item['Value'])) {
@@ -376,101 +500,77 @@ function mpesastk_payment_notification()
                 }
             }
             
-            $trx->status = 1; // Paid
+            if (empty($metadata['MpesaReceiptNumber'])) {
+                throw new Exception('Missing receipt number');
+            }
+            
+            $trx->status = 1;
             $trx->pg_paid_date = date('Y-m-d H:i:s');
             $trx->paid_date = date('Y-m-d H:i:s');
-            $trx->pg_payment_id = $metadata['MpesaReceiptNumber'] ?? '';
+            $trx->pg_payment_id = $metadata['MpesaReceiptNumber'];
             $trx->pg_payment_method = 'M-Pesa';
-            $trx->save();
+            
+            if (!$trx->save()) {
+                ORM::get_db()->rollBack();
+                throw new Exception('Failed to update transaction');
+            }
             
             // Process payment
             mpesastk_process_successful_payment($trx);
             
+            ORM::get_db()->commit();
             _log("Payment Success: $checkout_id", 'MPESA-CALLBACK');
         } else {
-            // Failed payment
-            $trx->status = 3; // Failed
+            $trx->status = 3;
             $trx->pg_message = $callback['ResultDesc'] ?? 'Payment failed';
             $trx->save();
+            ORM::get_db()->commit();
             
             _log("Payment Failed: $checkout_id - " . $trx->pg_message, 'MPESA-CALLBACK');
         }
         
     } catch (Exception $e) {
+        if (ORM::get_db()->inTransaction()) {
+            ORM::get_db()->rollBack();
+        }
         $response = [
             'ResultCode' => 1,
-            'ResultDesc' => 'Error: ' . $e->getMessage()
+            'ResultDesc' => 'Payment processing error'
         ];
         _log("Callback Error: " . $e->getMessage(), 'MPESA-ERROR');
     }
     
-    // 9. Send response
     echo json_encode($response);
     exit;
 }
 
 /**
- * Process successful payment
+ * Validate callback source IP
  */
-function mpesastk_process_successful_payment($trx)
+function mpesastk_validate_callback_source()
 {
-    try {
-        $user = ORM::for_table('tbl_customers')->find_one($trx->customer_id);
-        $plan = ORM::for_table('tbl_plans')->find_one($trx->plan_id);
-        
-        if (!$user || !$plan) {
-            throw new Exception('User or plan not found');
-        }
-        
-        $date_exp = date("Y-m-d", strtotime("+{$plan['validity']} day"));
-        
-        // Add to Mikrotik if enabled
-        if (!empty($trx->routers)) {
-            $mikrotik = Mikrotik::info($trx->routers);
-            if ($mikrotik && $mikrotik['enabled'] == '1') {
-                if ($plan['type'] == 'Hotspot') {
-                    Mikrotik::addHotspotUser($mikrotik, $user['username'], $plan, $user['password']);
-                } else if ($plan['type'] == 'PPPOE') {
-                    Mikrotik::addPpoeUser($mikrotik, $user['username'], $plan, $user['password']);
-                }
-            }
-        }
-        
-        // Update balance
-        Balance::plus($user['id'], $plan['price']);
-        
-        // Create recharge record
-        $recharge = ORM::for_table('tbl_user_recharges')->create();
-        $recharge->customer_id = $user['id'];
-        $recharge->username = $user['username'];
-        $recharge->plan_id = $plan['id'];
-        $recharge->namebp = $plan['name_plan'];
-        $recharge->recharged_on = date("Y-m-d");
-        $recharge->recharged_time = date("H:i:s");
-        $recharge->expiration = $date_exp;
-        $recharge->time = $plan['validity'];
-        $recharge->amount = $plan['price'];
-        $recharge->gateway = 'M-Pesa STK Push';
-        $recharge->payment_method = 'M-Pesa';
-        $recharge->routers = $trx->routers;
-        $recharge->type = 'Customer';
-        $recharge->save();
-        
-        // Update user expiration
-        $user->expiration = $date_exp;
-        $user->save();
-        
-        _log("User Activated: {$user['username']} on {$plan['name_plan']}", 'MPESA');
-        
-    } catch (Exception $e) {
-        _log("Payment Processing Error: " . $e->getMessage(), 'MPESA-ERROR');
-        throw $e;
+    $allowed_ips = [
+        '196.201.214.200', '196.201.214.206', // Safaricom IPs
+        '196.201.213.114', '196.201.212.127',
+        '196.201.212.138', '196.201.212.129',
+        '196.201.212.136', '196.201.212.74',
+        '196.201.212.69'
+    ];
+    
+    $client_ip = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? '';
+    
+    // Handle multiple IPs in X-Forwarded-For
+    if (strpos($client_ip, ',') !== false) {
+        $ips = array_map('trim', explode(',', $client_ip));
+        $client_ip = $ips[0];
     }
+    
+    return in_array($client_ip, $allowed_ips);
 }
 
-// ========================
-// 6. STATUS CHECKING
-// ========================
+// =============================================
+// 6. PAYMENT STATUS CHECKING
+// =============================================
 
 /**
  * Check payment status
@@ -560,7 +660,7 @@ function mpesastk_check_status($checkout_request_id)
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => json_encode($data),
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_TIMEOUT => 30
         ]);
         
@@ -569,8 +669,8 @@ function mpesastk_check_status($checkout_request_id)
         $error = curl_error($ch);
         curl_close($ch);
         
-        if ($error) throw new Exception("CURL Error: $error");
-        if ($http_code != 200) throw new Exception("HTTP $http_code");
+        if ($error) throw new Exception("Payment service unavailable");
+        if ($http_code != 200) throw new Exception("Payment service error");
         
         $result = json_decode($response, true);
         if (!isset($result['ResultCode'])) {
@@ -585,5 +685,68 @@ function mpesastk_check_status($checkout_request_id)
             'success' => false,
             'message' => $e->getMessage()
         ];
+    }
+}
+
+// =============================================
+// 7. PAYMENT PROCESSING
+// =============================================
+
+/**
+ * Process successful payment
+ */
+function mpesastk_process_successful_payment($trx)
+{
+    try {
+        $user = ORM::for_table('tbl_customers')->find_one($trx->customer_id);
+        $plan = ORM::for_table('tbl_plans')->find_one($trx->plan_id);
+        
+        if (!$user || !$plan) {
+            throw new Exception('User or plan not found');
+        }
+        
+        $date_exp = date("Y-m-d", strtotime("+{$plan['validity']} day"));
+        
+        // Add to Mikrotik if enabled
+        if (!empty($trx->routers)) {
+            $mikrotik = Mikrotik::info($trx->routers);
+            if ($mikrotik && $mikrotik['enabled'] == '1') {
+                if ($plan['type'] == 'Hotspot') {
+                    Mikrotik::addHotspotUser($mikrotik, $user['username'], $plan, $user['password']);
+                } else if ($plan['type'] == 'PPPOE') {
+                    Mikrotik::addPpoeUser($mikrotik, $user['username'], $plan, $user['password']);
+                }
+            }
+        }
+        
+        // Update balance
+        Balance::plus($user['id'], $plan['price']);
+        
+        // Create recharge record
+        $recharge = ORM::for_table('tbl_user_recharges')->create();
+        $recharge->customer_id = $user['id'];
+        $recharge->username = $user['username'];
+        $recharge->plan_id = $plan['id'];
+        $recharge->namebp = $plan['name_plan'];
+        $recharge->recharged_on = date("Y-m-d");
+        $recharge->recharged_time = date("H:i:s");
+        $recharge->expiration = $date_exp;
+        $recharge->time = $plan['validity'];
+        $recharge->amount = $plan['price'];
+        $recharge->gateway = 'M-Pesa STK Push';
+        $recharge->payment_method = 'M-Pesa';
+        $recharge->routers = $trx->routers;
+        $recharge->type = 'Customer';
+        $recharge->save();
+        
+        // Update user expiration
+        $user->expiration = $date_exp;
+        $user->save();
+        
+        _log("User Activated: {$user['username']} on {$plan['name_plan']}", 'MPESA');
+        
+    } catch (Exception $e) {
+        _log("Payment Processing Error: " . $e->getMessage(), 'MPESA-ERROR');
+        throw $e;
     }
 }
