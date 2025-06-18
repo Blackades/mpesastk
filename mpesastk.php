@@ -321,54 +321,61 @@ function mpesastk_create_transaction($trx, $user)
 // ========================
 
 /**
- * Payment notification callback - FINAL WORKING VERSION
+ * Payment notification callback - NO IP VALIDATION (TESTING ONLY)
  */
 function mpesastk_payment_notification()
 {
-    // 1. Set headers
     header('Content-Type: application/json');
-    
-    // 2. Default response
-    $response = [
-        'ResultCode' => 0,
-        'ResultDesc' => 'Callback processed successfully'
-    ];
+    $response = ['ResultCode' => 0, 'ResultDesc' => 'Callback processed successfully'];
     
     try {
-        // 3. Get raw input
         $input = file_get_contents('php://input');
-        if (empty($input)) throw new Exception('Empty callback data');
-        
-        // 4. Log raw data
-        _log("Raw Callback: $input", 'MPESA-CALLBACK');
-        
-        // 5. Parse JSON
-        $data = json_decode($input, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('Invalid JSON: ' . json_last_error_msg());
+        if (empty($input)) {
+            throw new Exception('Empty callback data');
         }
         
-        // 6. Validate structure
-        if (!isset($data['Body']['stkCallback'])) {
-            throw new Exception('Invalid callback format');
+        _log("Raw Callback: $input", 'MPESA-CALLBACK');
+        
+        $data = json_decode($input, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new Exception('Invalid JSON: '.json_last_error_msg());
+        }
+        
+        // Validate callback structure
+        if (!isset($data['Body']['stkCallback']['CheckoutRequestID'])) {
+            throw new Exception('Invalid callback structure. Missing CheckoutRequestID');
         }
         
         $callback = $data['Body']['stkCallback'];
-        $checkout_id = $callback['CheckoutRequestID'] ?? '';
-        if (empty($checkout_id)) throw new Exception('Missing CheckoutRequestID');
+        $checkout_id = $callback['CheckoutRequestID'];
         
-        // 7. Find transaction
+        // Begin transaction with locking
+        ORM::get_db()->beginTransaction();
+        
         $trx = ORM::for_table('tbl_payment_gateway')
             ->where('pg_token', $checkout_id)
+            ->lock('FOR UPDATE')
             ->find_one();
             
-        if (!$trx) throw new Exception("Transaction not found: $checkout_id");
+        if (!$trx) {
+            throw new Exception("Transaction not found for CheckoutRequestID: $checkout_id");
+        }
         
-        // 8. Process callback
+        // Check if already processed
+        if (!empty($trx->pg_paid_response)) {
+            ORM::get_db()->rollBack();
+            throw new Exception('Callback already processed for this transaction');
+        }
+        
         $trx->pg_paid_response = $input;
         
         if ($callback['ResultCode'] == 0) {
-            // Successful payment
+            // Verify transaction hasn't been processed already
+            if ($trx->status == 1) {
+                ORM::get_db()->rollBack();
+                throw new Exception('Transaction already completed');
+            }
+            
             $metadata = [];
             foreach ($callback['CallbackMetadata']['Item'] ?? [] as $item) {
                 if (isset($item['Name'], $item['Value'])) {
@@ -376,35 +383,50 @@ function mpesastk_payment_notification()
                 }
             }
             
-            $trx->status = 1; // Paid
+            if (empty($metadata['MpesaReceiptNumber'])) {
+                throw new Exception('Missing receipt number in callback');
+            }
+            
+            $trx->status = 1;
             $trx->pg_paid_date = date('Y-m-d H:i:s');
             $trx->paid_date = date('Y-m-d H:i:s');
-            $trx->pg_payment_id = $metadata['MpesaReceiptNumber'] ?? '';
+            $trx->pg_payment_id = $metadata['MpesaReceiptNumber'];
             $trx->pg_payment_method = 'M-Pesa';
-            $trx->save();
+            
+            if (!$trx->save()) {
+                ORM::get_db()->rollBack();
+                throw new Exception('Database error while updating transaction');
+            }
             
             // Process payment
             mpesastk_process_successful_payment($trx);
             
+            ORM::get_db()->commit();
             _log("Payment Success: $checkout_id", 'MPESA-CALLBACK');
         } else {
-            // Failed payment
-            $trx->status = 3; // Failed
+            $trx->status = 3;
             $trx->pg_message = $callback['ResultDesc'] ?? 'Payment failed';
             $trx->save();
+            ORM::get_db()->commit();
             
             _log("Payment Failed: $checkout_id - " . $trx->pg_message, 'MPESA-CALLBACK');
         }
         
     } catch (Exception $e) {
+        if (ORM::get_db()->inTransaction()) {
+            ORM::get_db()->rollBack();
+        }
         $response = [
             'ResultCode' => 1,
-            'ResultDesc' => 'Error: ' . $e->getMessage()
+            'ResultDesc' => $e->getMessage(),
+            'Debug' => [
+                'Time' => date('Y-m-d H:i:s'),
+                'Input' => $input ?? null
+            ]
         ];
         _log("Callback Error: " . $e->getMessage(), 'MPESA-ERROR');
     }
     
-    // 9. Send response
     echo json_encode($response);
     exit;
 }
