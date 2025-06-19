@@ -360,23 +360,25 @@ function mpesastk_payment_notification()
         
         // Check if already processed
         if (!empty($trx->pg_paid_response)) {
-            throw new Exception('Callback already processed for this transaction');
+            _log('Callback already processed for transaction: ' . $trx->id, 'MPESA-CALLBACK');
+            // Return success to avoid repeated callbacks
+            echo json_encode($response);
+            exit;
         }
         
         // Store raw callback data
         $trx->pg_paid_response = $input;
         
         if ($callback['ResultCode'] == 0) {
-            // Verify transaction hasn't been processed already
-            if ($trx->status == 1) {
-                throw new Exception('Transaction already completed');
-            }
+            // SUCCESS - Process payment
             
             // Extract metadata from callback
             $metadata = [];
-            foreach ($callback['CallbackMetadata']['Item'] ?? [] as $item) {
-                if (isset($item['Name'], $item['Value'])) {
-                    $metadata[$item['Name']] = $item['Value'];
+            if (isset($callback['CallbackMetadata']['Item'])) {
+                foreach ($callback['CallbackMetadata']['Item'] as $item) {
+                    if (isset($item['Name'], $item['Value'])) {
+                        $metadata[$item['Name']] = $item['Value'];
+                    }
                 }
             }
             
@@ -384,28 +386,49 @@ function mpesastk_payment_notification()
                 throw new Exception('Missing receipt number in callback');
             }
             
-            // Update transaction record
-            $trx->status = 1; // Mark as paid
-            $trx->paid_date = date('Y-m-d H:i:s');
-            $trx->payment_method = 'M-Pesa';
-            $trx->gateway_trx_id = $metadata['MpesaReceiptNumber']; // Store receipt number
-            $trx->payment_channel = 'M-Pesa STK Push';
+            // Start transaction to ensure atomicity
+            ORM::get_db()->beginTransaction();
             
-            if (!$trx->save()) {
-                throw new Exception('Database error while updating transaction');
+            try {
+                // Update transaction record FIRST
+                $trx->status = 1; // Mark as paid
+                $trx->paid_date = date('Y-m-d H:i:s');
+                $trx->payment_method = 'M-Pesa';
+                $trx->payment_channel = 'M-Pesa STK Push';
+                
+                // Store receipt number in a separate field or append to existing gateway_trx_id
+                $trx->pg_paid_response = json_encode([
+                    'receipt_number' => $metadata['MpesaReceiptNumber'],
+                    'amount' => $metadata['Amount'] ?? null,
+                    'phone' => $metadata['PhoneNumber'] ?? null,
+                    'callback_data' => $callback
+                ]);
+                
+                if (!$trx->save()) {
+                    throw new Exception('Failed to update transaction record');
+                }
+                
+                // THEN process the successful payment
+                mpesastk_process_successful_payment($trx);
+                
+                // Commit transaction
+                ORM::get_db()->commit();
+                
+                _log("Payment Success: $checkout_id - Receipt: {$metadata['MpesaReceiptNumber']}", 'MPESA-CALLBACK');
+                
+            } catch (Exception $e) {
+                // Rollback on any error
+                ORM::get_db()->rollback();
+                throw $e;
             }
             
-            // Process payment (add user time, etc.)
-            mpesastk_process_successful_payment($trx);
-            
-            _log("Payment Success: $checkout_id", 'MPESA-CALLBACK');
         } else {
-            // Payment failed
+            // FAILED - Update status
             $trx->status = 3; // Mark as failed
-            $trx->pg_paid_response = $callback['ResultDesc'] ?? 'Payment failed';
+            $trx->pg_message = $callback['ResultDesc'] ?? 'Payment failed';
             $trx->save();
             
-            _log("Payment Failed: $checkout_id - " . $trx->pg_paid_response, 'MPESA-CALLBACK');
+            _log("Payment Failed: $checkout_id - " . $trx->pg_message, 'MPESA-CALLBACK');
         }
         
     } catch (Exception $e) {
@@ -414,7 +437,8 @@ function mpesastk_payment_notification()
             'ResultDesc' => $e->getMessage(),
             'Debug' => [
                 'Time' => date('Y-m-d H:i:s'),
-                'Input' => $input ?? ''
+                'Input' => $input ?? '',
+                'Error' => $e->getMessage()
             ]
         ];
         _log("Callback Error: " . $e->getMessage(), 'MPESA-ERROR');
@@ -430,58 +454,132 @@ function mpesastk_payment_notification()
 function mpesastk_process_successful_payment($trx)
 {
     try {
+        // Validate transaction object
+        if (!$trx || !$trx->user_id || !$trx->plan_id) {
+            throw new Exception('Invalid transaction data');
+        }
+        
+        // Get user and plan
         $user = ORM::for_table('tbl_customers')->find_one($trx->user_id);
         $plan = ORM::for_table('tbl_plans')->find_one($trx->plan_id);
         
-        if (!$user || !$plan) {
-            throw new Exception('User or plan not found');
+        if (!$user) {
+            throw new Exception("User not found: {$trx->user_id}");
         }
         
-        $date_exp = date("Y-m-d", strtotime("+{$plan['validity']} day"));
+        if (!$plan) {
+            throw new Exception("Plan not found: {$trx->plan_id}");
+        }
         
-        // Add to Mikrotik if enabled
+        _log("Processing payment for user: {$user->username}, plan: {$plan->name_plan}", 'MPESA');
+        
+        // Calculate expiration date
+        $current_expiry = $user->expiration;
+        if ($current_expiry && strtotime($current_expiry) > time()) {
+            // Extend from current expiry if still active
+            $date_exp = date("Y-m-d", strtotime($current_expiry . " +{$plan->validity} day"));
+        } else {
+            // Start from today if expired or no previous expiry
+            $date_exp = date("Y-m-d", strtotime("+{$plan->validity} day"));
+        }
+        
+        // Add to Mikrotik if enabled and router specified
         if (!empty($trx->routers)) {
-            $mikrotik = Mikrotik::info($trx->routers);
-            if ($mikrotik && $mikrotik['enabled'] == '1') {
-                if ($plan['type'] == 'Hotspot') {
-                    Mikrotik::addHotspotUser($mikrotik, $user['username'], $plan, $user['password']);
-                } else if ($plan['type'] == 'PPPOE') {
-                    Mikrotik::addPpoeUser($mikrotik, $user['username'], $plan, $user['password']);
+            try {
+                $mikrotik = Mikrotik::info($trx->routers);
+                if ($mikrotik && $mikrotik['enabled'] == '1') {
+                    if ($plan->type == 'Hotspot') {
+                        Mikrotik::addHotspotUser($mikrotik, $user->username, $plan, $user->password);
+                        _log("Added Hotspot user: {$user->username}", 'MPESA');
+                    } else if ($plan->type == 'PPPOE') {
+                        Mikrotik::addPpoeUser($mikrotik, $user->username, $plan, $user->password);
+                        _log("Added PPPOE user: {$user->username}", 'MPESA');
+                    }
                 }
+            } catch (Exception $e) {
+                _log("Mikrotik Error: " . $e->getMessage(), 'MPESA-ERROR');
+                // Don't fail the entire process if Mikrotik fails
             }
         }
         
-        // Update balance
-        Balance::plus($user['id'], $plan['price']);
+        // Update user balance
+        try {
+            Balance::plus($user->id, $plan->price);
+            _log("Added balance: {$plan->price} to user: {$user->username}", 'MPESA');
+        } catch (Exception $e) {
+            _log("Balance Error: " . $e->getMessage(), 'MPESA-ERROR');
+            // Continue even if balance update fails
+        }
         
         // Create recharge record
         $recharge = ORM::for_table('tbl_user_recharges')->create();
-        $recharge->customer_id = $user['id'];
-        $recharge->username = $user['username'];
-        $recharge->plan_id = $plan['id'];
-        $recharge->namebp = $plan['name_plan'];
+        $recharge->customer_id = $user->id;
+        $recharge->username = $user->username;
+        $recharge->plan_id = $plan->id;
+        $recharge->namebp = $plan->name_plan;
         $recharge->recharged_on = date("Y-m-d");
         $recharge->recharged_time = date("H:i:s");
         $recharge->expiration = $date_exp;
-        $recharge->time = $plan['validity'];
-        $recharge->amount = $plan['price'];
+        $recharge->time = $plan->validity;
+        $recharge->amount = $plan->price;
         $recharge->gateway = 'M-Pesa STK Push';
         $recharge->payment_method = 'M-Pesa';
         $recharge->routers = $trx->routers;
         $recharge->type = 'Customer';
-        $recharge->save();
+        
+        if (!$recharge->save()) {
+            throw new Exception('Failed to create recharge record');
+        }
         
         // Update user expiration
         $user->expiration = $date_exp;
-        $user->save();
+        if (!$user->save()) {
+            throw new Exception('Failed to update user expiration');
+        }
         
-        _log("User Activated: {$user['username']} on {$plan['name_plan']}", 'MPESA');
+        _log("User Activated: {$user->username} on {$plan->name_plan} until {$date_exp}", 'MPESA');
+        
+        // Send notification if function exists
+        if (function_exists('sendSMS') || function_exists('sendEmail')) {
+            try {
+                $message = "Payment successful! Your {$plan->name_plan} plan is now active until {$date_exp}.";
+                
+                if (function_exists('sendSMS') && !empty($user->phonenumber)) {
+                    sendSMS($user->phonenumber, $message);
+                }
+                
+                if (function_exists('sendEmail') && !empty($user->email)) {
+                    sendEmail($user->email, 'Payment Confirmation', $message);
+                }
+            } catch (Exception $e) {
+                _log("Notification Error: " . $e->getMessage(), 'MPESA-ERROR');
+                // Don't fail if notification fails
+            }
+        }
+        
+        return true;
         
     } catch (Exception $e) {
         _log("Payment Processing Error: " . $e->getMessage(), 'MPESA-ERROR');
         throw $e;
     }
 }
+
+function mpesastk_log($message, $type = 'MPESA')
+{
+    $timestamp = date('Y-m-d H:i:s');
+    $log_entry = "[$timestamp] [$type] $message" . PHP_EOL;
+    
+    // Log to file if logging is enabled
+    if (function_exists('_log')) {
+        _log($message, $type);
+    }
+    
+    // Also log to a specific M-Pesa log file
+    $log_file = 'storage/logs/mpesa_' . date('Y-m-d') . '.log';
+    file_put_contents($log_file, $log_entry, FILE_APPEND | LOCK_EX);
+}
+
 
 // ========================
 // 6. STATUS CHECKING
