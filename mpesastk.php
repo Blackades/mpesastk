@@ -321,7 +321,7 @@ function mpesastk_create_transaction($trx, $user)
 // ========================
 
 /**
- * Payment notification callback - NO IP VALIDATION & NO LOCKING (TESTING ONLY)
+ * Payment notification callback - PHPNuxBill compatible version
  */
 function mpesastk_payment_notification()
 {
@@ -349,9 +349,9 @@ function mpesastk_payment_notification()
         $callback = $data['Body']['stkCallback'];
         $checkout_id = $callback['CheckoutRequestID'];
         
-        // Find transaction WITHOUT locking (since Idiorm doesn't support it)
+        // Find transaction using gateway_trx_id field
         $trx = ORM::for_table('tbl_payment_gateway')
-            ->where('pg_token', $checkout_id)
+            ->where('gateway_trx_id', $checkout_id)
             ->find_one();
             
         if (!$trx) {
@@ -363,6 +363,7 @@ function mpesastk_payment_notification()
             throw new Exception('Callback already processed for this transaction');
         }
         
+        // Store raw callback data
         $trx->pg_paid_response = $input;
         
         if ($callback['ResultCode'] == 0) {
@@ -371,6 +372,7 @@ function mpesastk_payment_notification()
                 throw new Exception('Transaction already completed');
             }
             
+            // Extract metadata from callback
             $metadata = [];
             foreach ($callback['CallbackMetadata']['Item'] ?? [] as $item) {
                 if (isset($item['Name'], $item['Value'])) {
@@ -382,26 +384,27 @@ function mpesastk_payment_notification()
                 throw new Exception('Missing receipt number in callback');
             }
             
-            $trx->status = 1;
-            $trx->pg_paid_date = date('Y-m-d H:i:s');
+            // Update transaction record
+            $trx->status = 1; // Mark as paid
             $trx->paid_date = date('Y-m-d H:i:s');
-            $trx->pg_payment_id = $metadata['MpesaReceiptNumber'];
-            $trx->pg_payment_method = 'M-Pesa';
+            $trx->payment_method = 'M-Pesa';
+            $trx->gateway_trx_id = $metadata['MpesaReceiptNumber']; // Store receipt number
             
             if (!$trx->save()) {
                 throw new Exception('Database error while updating transaction');
             }
             
-            // Process payment
+            // Process payment (add user time, etc.)
             mpesastk_process_successful_payment($trx);
             
             _log("Payment Success: $checkout_id", 'MPESA-CALLBACK');
         } else {
-            $trx->status = 3;
-            $trx->pg_message = $callback['ResultDesc'] ?? 'Payment failed';
+            // Payment failed
+            $trx->status = 3; // Mark as failed
+            $trx->pg_paid_response = $callback['ResultDesc'] ?? 'Payment failed';
             $trx->save();
             
-            _log("Payment Failed: $checkout_id - " . $trx->pg_message, 'MPESA-CALLBACK');
+            _log("Payment Failed: $checkout_id - " . $trx->pg_paid_response, 'MPESA-CALLBACK');
         }
         
     } catch (Exception $e) {
@@ -426,7 +429,7 @@ function mpesastk_payment_notification()
 function mpesastk_process_successful_payment($trx)
 {
     try {
-        $user = ORM::for_table('tbl_customers')->find_one($trx->customer_id);
+        $user = ORM::for_table('tbl_customers')->find_one($trx->user_id);
         $plan = ORM::for_table('tbl_plans')->find_one($trx->plan_id);
         
         if (!$user || !$plan) {
