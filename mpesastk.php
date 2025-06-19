@@ -413,7 +413,7 @@ function mpesastk_payment_notification()
             'ResultDesc' => $e->getMessage(),
             'Debug' => [
                 'Time' => date('Y-m-d H:i:s'),
-                'Input' => $input ?? null
+                'Input' => $input ?? ''
             ]
         ];
         _log("Callback Error: " . $e->getMessage(), 'MPESA-ERROR');
