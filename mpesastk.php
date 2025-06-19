@@ -280,16 +280,16 @@ function mpesastk_create_transaction($trx, $user)
         $record = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
         if (!$record) throw new Exception('Transaction not found');
         
-        $record->pg_request_data = json_encode([
+        $record->pg_request = json_encode([
             'phone' => $phone,
             'amount' => $trx['price'],
             'reference' => $trx['id']
         ]);
         
-        $record->pg_raw_data = json_encode($response);
+        $record->pg_request_data = json_encode($response);
         
         if ($response['success']) {
-            $record->pg_token = $response['CheckoutRequestID'];
+            $record->gateway_trx_id = $response['CheckoutRequestID']; // Using gateway_trx_id instead of pg_token
             $record->pg_url_payment = U . 'order/view/' . $trx['id'];
             $record->status = 2; // Pending
             $record->save();
@@ -389,6 +389,7 @@ function mpesastk_payment_notification()
             $trx->paid_date = date('Y-m-d H:i:s');
             $trx->payment_method = 'M-Pesa';
             $trx->gateway_trx_id = $metadata['MpesaReceiptNumber']; // Store receipt number
+            $trx->payment_channel = 'M-Pesa STK Push';
             
             if (!$trx->save()) {
                 throw new Exception('Database error while updating transaction');
@@ -492,11 +493,11 @@ function mpesastk_process_successful_payment($trx)
 function mpesastk_get_status($trx, $user)
 {
     try {
-        if (empty($trx['pg_token'])) {
+        if (empty($trx['gateway_trx_id'])) {
             throw new Exception('No checkout request ID');
         }
         
-        $response = mpesastk_check_status($trx['pg_token']);
+        $response = mpesastk_check_status($trx['gateway_trx_id']);
         
         $record = ORM::for_table('tbl_payment_gateway')->find_one($trx['id']);
         if (!$record) throw new Exception('Transaction not found');
